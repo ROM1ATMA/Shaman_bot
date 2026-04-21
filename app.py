@@ -9,7 +9,7 @@ from telegram import Update, Bot, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- Конфигурация (ключи из переменных окружения) ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY")
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 
