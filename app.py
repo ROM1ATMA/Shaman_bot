@@ -422,8 +422,16 @@ async def startup():
     global tg_app, bot
     print("🚀 Запуск Шаман-бота с VseGPT (webhook)...")
     
-    bot = Bot(token=TELEGRAM_TOKEN)
-    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Явная проверка токена
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        print("❌ TELEGRAM_TOKEN не найден в переменных окружения!")
+        return
+    
+    print(f"✅ TELEGRAM_TOKEN загружен: {token[:10]}...")
+    
+    bot = Bot(token=token)
+    tg_app = Application.builder().token(token).build()
     
     tg_app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     tg_app.add_handler(CommandHandler("meditation", meditation))
@@ -434,12 +442,14 @@ async def startup():
     await tg_app.initialize()
     await tg_app.start()
     
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(url=WEBHOOK_URL)
-    
-    webhook_info = await bot.get_webhook_info()
-    print(f"✅ Webhook установлен: {webhook_info.url}")
-    print("✅ Бот готов к работе!")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(url=WEBHOOK_URL)
+        webhook_info = await bot.get_webhook_info()
+        print(f"✅ Webhook установлен: {webhook_info.url}")
+        print("✅ Бот готов к работе!")
+    except Exception as e:
+        print(f"❌ Ошибка установки webhook: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
