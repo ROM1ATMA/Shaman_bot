@@ -4,12 +4,11 @@ import re
 import tempfile
 import openai
 import requests
-import time
 from fastapi import FastAPI, Request, Response
 from telegram import Update, Bot, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- Конфигурация (ключи из Secrets) ---
+# --- Конфигурация (ключи из переменных окружения) ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY")
 VSEGPT_MODEL = "deepseek/deepseek-chat"
@@ -255,8 +254,8 @@ async def generate_image(user_prompt: str) -> str:
             continue
     raise Exception("Все варианты запроса не дали результата")
 
-# Получаем публичный URL Space
-SPACE_HOST = os.getenv("SPACE_HOST", "romanuja-shaman-ai-v2.hf.space")
+# --- Домен Bothost (жёстко прописан) ---
+SPACE_HOST = "nl7.bothost.ru"
 WEBHOOK_URL = f"https://{SPACE_HOST}/webhook"
 WEBHOOK_PATH = "/webhook"
 
@@ -315,7 +314,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌿 Приветствую, путник! 🌿\n\n"
         "Я — проводник в мир духов. Расскажи о своём опыте саунд-хилинга или шаманского путешествия, "
         "и я помогу тебе увидеть его глубину и интегрировать полученные дары.\n\n"
-        "Ты можешь отправить текст или голосовое сообщение — я пойму.\n\n"
         "Выбери, куда хочешь отправиться:",
         reply_markup=get_main_keyboard()
     )
@@ -459,4 +457,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 3000)))
