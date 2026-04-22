@@ -417,43 +417,6 @@ async def webhook(request: Request):
         print(f"Ошибка webhook: {e}")
         return Response(status_code=500)
 
-# --- Установка webhook при старте (в глобальной области) ---
-import asyncio
-import nest_asyncio
-nest_asyncio.apply()
-
-async def setup_webhook():
-    global tg_app, bot
-    print("🚀 Запуск Шаман-бота с VseGPT (webhook)...")
-    
-    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        print("❌ Токен не найден!")
-        return
-    
-    print(f"✅ Токен загружен: {token[:10]}...")
-    
-    bot = Bot(token=token)
-    tg_app = Application.builder().token(token).build()
-    
-    tg_app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
-    tg_app.add_handler(CommandHandler("meditation", meditation))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r'^(🧘 Медитация|🔮 Анализ опыта|🎨 Визуализировать образ|📖 О проекте)$') & filters.ChatType.PRIVATE, handle_buttons))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
-    tg_app.add_error_handler(error_handler)
-    
-    await tg_app.initialize()
-    await tg_app.start()
-    
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(url=WEBHOOK_URL)
-        webhook_info = await bot.get_webhook_info()
-        print(f"✅ Webhook установлен: {webhook_info.url}")
-        print("✅ Бот готов к работе!")
-    except Exception as e:
-        print(f"❌ Ошибка установки webhook: {e}")
-
 @app.on_event("startup")
 async def startup():
     print("🔥🔥🔥 ФУНКЦИЯ STARTUP ВЫЗВАНА 🔥🔥🔥")
@@ -487,7 +450,7 @@ async def startup():
         print("✅ Бот готов к работе!")
     except Exception as e:
         print(f"❌ Ошибка установки webhook: {e}")
-
+        
 @app.on_event("shutdown")
 async def shutdown():
     print("🔥🔥🔥 ФУНКЦИЯ SHUTDOWN ВЫЗВАНА 🔥🔥🔥")
