@@ -417,18 +417,21 @@ async def webhook(request: Request):
         print(f"Ошибка webhook: {e}")
         return Response(status_code=500)
 
-@app.on_event("startup")
-async def startup():
+# --- Установка webhook при старте (в глобальной области) ---
+import asyncio
+import nest_asyncio
+nest_asyncio.apply()
+
+async def setup_webhook():
     global tg_app, bot
     print("🚀 Запуск Шаман-бота с VseGPT (webhook)...")
     
-    # Явная проверка токена
-    token = os.getenv("TELEGRAM_TOKEN")
+    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
     if not token:
-        print("❌ TELEGRAM_TOKEN не найден в переменных окружения!")
+        print("❌ Токен не найден!")
         return
     
-    print(f"✅ TELEGRAM_TOKEN загружен: {token[:10]}...")
+    print(f"✅ Токен загружен: {token[:10]}...")
     
     bot = Bot(token=token)
     tg_app = Application.builder().token(token).build()
@@ -451,6 +454,14 @@ async def startup():
     except Exception as e:
         print(f"❌ Ошибка установки webhook: {e}")
 
+# Запускаем установку webhook в фоне
+def run_setup():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(setup_webhook())
+
+import threading
+threading.Thread(target=run_setup, daemon=True).start()
 @app.on_event("shutdown")
 async def shutdown():
     global tg_app, bot
