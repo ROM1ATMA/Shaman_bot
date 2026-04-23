@@ -486,4 +486,14 @@ async def health():
     
 if __name__ == "__main__":
     import uvicorn
+    import asyncio
+    
+    # Сначала настраиваем webhook в фоне
+    async def init():
+        await startup()
+    
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init())
+    
+    # Потом запускаем сервер (он будет держать контейнер живым)
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 3000)))
