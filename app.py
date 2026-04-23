@@ -3,26 +3,23 @@ import json
 import sys
 import re
 import tempfile
-import asyncio
 import openai
 import requests
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib import error, parse, request
+from urllib import error, request
 
 # --- Конфигурация ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("API_TOKEN", "").strip()
 VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "3000"))
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 
-# --- НАСТРОЙКИ ДЛЯ МЕДИТАЦИИ ---
 CHANNEL_ID = -1002677656270
 MEDITATION_MESSAGE_ID = 222
 
-# Стили для генерации
 BASE_STYLE_CLEAN = (
     "fairy-tale illustration, ethereal magical dreamlike atmosphere, "
     "entire image in deep blue and soft gold color palette, blue ambient lighting, golden highlights, "
@@ -40,23 +37,27 @@ BASE_STYLE_EPIC = (
     "magical glowing light, album cover aesthetic"
 )
 
-# Настройка OpenAI
 if VSEGPT_API_KEY:
     openai.api_base = "https://api.vsegpt.ru:6070/v1"
     openai.api_key = VSEGPT_API_KEY
 
-# Системный промт (сокращён для краткости, вставь свой полный)
-SYSTEM_PROMPT = "Ты — Интегральный Картограф Сознания..."
-
-# Хранилище истории
 conversation_history = {}
 last_user_experience = {}
 MAX_HISTORY = 10
 
+SYSTEM_PROMPT = (
+    "Ты — Интегральный Картограф Сознания. Твоя задача — дать человеку многоуровневую, практическую карту его опыта, нормализовать его и предложить углубление.\n\n"
+    "ТВОЙ ОТВЕТ СТРОГО ДЕЛИТСЯ НА ТРИ ЧАСТИ:\n"
+    "1. **Нейрофизиологическая карта.** Ты ОБЯЗАН начать с описания того, что происходило в мозге и нервной системе человека на каждом этапе его путешествия. Используй термины: дефолт-система мозга, лимбическая система, тета-волны, симпатическая/парасимпатическая система. Твоя цель — нормализовать опыт, показать, что это реальные, изучаемые процессы.\n"
+    "2. **Интегральный анализ (Юнг + Шаманизм).** После нейрофизиологии ты раскрываешь ключевые образы через призму архетипов (Тень, Анима, Самость, Мудрец и т.д.) и шаманских традиций (Дух-Помощник, Тотем, Путешествие между мирами). Ты даёшь языки и карту для понимания.\n"
+    "3. **Предложение углубления.** Ты ЗАВЕРШАЕШЬ свой ответ одной и той же фразой: «Если хочешь, я могу показать тебе архитектурный уровень этого опыта — как он пересобирает саму геометрию твоей реальности. Просто напиши „да“».\n\n"
+    "СТИЛЬ: Чистый русский язык. Понятный, приземлённый, структурный. Без маркдауна."
+)
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def log(message: str) -> None:
+def safe_log(message: str) -> None:
     print(f"[{utc_now()}] {message}", flush=True)
 
 def telegram_api(method: str, payload: dict) -> tuple[bool, str]:
@@ -105,6 +106,8 @@ def generate_image(user_prompt: str) -> str:
             return tmp.name
     raise Exception("Не удалось сгенерировать")
 
+import asyncio
+
 async def query_vsegpt(user_id: int, user_message: str) -> str:
     if user_id not in conversation_history:
         conversation_history[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -119,7 +122,7 @@ async def query_vsegpt(user_id: int, user_message: str) -> str:
         conversation_history[user_id].append({"role": "assistant", "content": content})
         return content
     except Exception as e:
-        log(f"VseGPT error: {e}")
+        safe_log(f"VseGPT error: {e}")
         return "🌫️ Духи на переправе..."
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -144,18 +147,17 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "Not found"})
             return
 
-        # Проверка секретного токена
         if WEBHOOK_SECRET:
             incoming = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if incoming != WEBHOOK_SECRET:
-                log("Rejected: invalid secret token")
+                safe_log("Rejected: invalid secret token")
                 self._send_json(403, {"ok": False, "error": "Invalid secret"})
                 return
 
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         decoded = raw.decode("utf-8", errors="replace")
-        log(f"Webhook received: {decoded[:200]}...")
+        safe_log(f"Webhook received: {decoded[:200]}...")
 
         try:
             update = json.loads(decoded) if decoded else {}
@@ -169,14 +171,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
         text = message.get("text", "")
 
         if chat_id and text:
-            # Обработка сообщения
             if text.startswith("/start"):
                 reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте..."
                 telegram_api("sendMessage", {"chat_id": chat_id, "text": reply})
             elif text.startswith("/meditation"):
                 telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
             else:
-                # Отправляем на анализ
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 response = loop.run_until_complete(query_vsegpt(chat_id, text))
@@ -186,29 +186,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def log_message(self, format: str, *args) -> None:
-        log(f"{self.client_address[0]} - {format % args}")
+        safe_log(f"{self.client_address[0]} - {format % args}")
 
 def set_webhook(public_url: str) -> int:
     payload = {"url": f"{public_url.rstrip('/')}/webhook"}
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
     ok, resp = telegram_api("setWebhook", payload)
-    log(f"setWebhook: {resp}")
+    safe_log(f"setWebhook: {resp}")
     return 0 if ok else 1
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--set-webhook":
-        sys.exit(set_webhook(sys.argv[2].strip()))
-
     if not BOT_TOKEN:
-        log("ERROR: BOT_TOKEN is empty")
+        safe_log("ERROR: BOT_TOKEN is empty")
         sys.exit(1)
 
-    log(f"Starting Shaman Bot on {HOST}:{PORT}")
+    safe_log(f"Starting Shaman Bot on {HOST}:{PORT}")
     server = HTTPServer((HOST, PORT), WebhookHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log("Shutting down...")
+        safe_log("Shutting down...")
     finally:
         server.server_close()
