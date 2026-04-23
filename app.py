@@ -416,7 +416,21 @@ async def webhook(request: Request):
     except Exception as e:
         print(f"Ошибка webhook: {e}")
         return Response(status_code=500)
+@app.get("/")
+@app.head("/")
+async def root():
+    return {"status": "ok"}
 
+@app.get("/health")
+@app.head("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/ping")
+@app.head("/ping")
+async def ping():
+    return {"status": "ok"}
+    
 @app.on_event("startup")
 async def startup():
     print("🔥🔥🔥 ФУНКЦИЯ STARTUP ВЫЗВАНА 🔥🔥🔥")
