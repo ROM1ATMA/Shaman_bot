@@ -456,25 +456,21 @@ async def startup():
     await tg_app.initialize()
     await tg_app.start()
     
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(url=WEBHOOK_URL)
-        webhook_info = await bot.get_webhook_info()
-        print(f"✅ Webhook установлен: {webhook_info.url}")
-        print("✅ Бот готов к работе!")
-    except Exception as e:
-        print(f"❌ Ошибка установки webhook: {e}")
-        
-@app.on_event("shutdown")
-async def shutdown():
-    print("🔥🔥🔥 ФУНКЦИЯ SHUTDOWN ВЫЗВАНА 🔥🔥🔥")
-    global tg_app, bot
-    if bot:
-        await bot.delete_webhook(drop_pending_updates=True)
-    if tg_app:
-        await tg_app.stop()
-        await tg_app.shutdown()
-    print("👋 Бот остановлен")
+    # Повторные попытки установки webhook с задержкой
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            await asyncio.sleep(3)  # Ждём 3 секунды перед попыткой
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.set_webhook(url=WEBHOOK_URL)
+            webhook_info = await bot.get_webhook_info()
+            print(f"✅ Webhook установлен: {webhook_info.url}")
+            print("✅ Бот готов к работе!")
+            break
+        except Exception as e:
+            print(f"⚠️ Попытка {attempt + 1}/{max_retries}: {e}")
+            if attempt == max_retries - 1:
+                print("❌ Не удалось установить webhook после всех попыток")
 
 @app.get("/")
 async def health_check():
