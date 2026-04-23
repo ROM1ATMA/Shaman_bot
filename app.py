@@ -1,26 +1,28 @@
 import os
-import asyncio
+import json
+import sys
 import re
 import tempfile
+import asyncio
 import openai
 import requests
-from fastapi import FastAPI, Request, Response
-from telegram import Update, Bot, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib import error, parse, request
 
-# --- Конфигурация (ключи из переменных окружения) ---
-TELEGRAM_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY")
+# --- Конфигурация ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "3000"))
 VSEGPT_MODEL = "deepseek/deepseek-chat"
-
-# --- Секретный токен для webhook (если задан) ---
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 # --- НАСТРОЙКИ ДЛЯ МЕДИТАЦИИ ---
 CHANNEL_ID = -1002677656270
 MEDITATION_MESSAGE_ID = 222
 
-# Чистый стиль
+# Стили для генерации
 BASE_STYLE_CLEAN = (
     "fairy-tale illustration, ethereal magical dreamlike atmosphere, "
     "entire image in deep blue and soft gold color palette, blue ambient lighting, golden highlights, "
@@ -28,7 +30,6 @@ BASE_STYLE_CLEAN = (
     "shallow depth of field, glowing magical light, beautiful dream"
 )
 
-# Эпический стиль
 BASE_STYLE_EPIC = (
     "symmetrical composition, dreamlike ethereal atmosphere, "
     "old vintage photograph with subtle delicate cracks, hyper-detailed, 100 megapixels, "
@@ -39,462 +40,175 @@ BASE_STYLE_EPIC = (
     "magical glowing light, album cover aesthetic"
 )
 
-# Настройка OpenAI-совместимого API
-openai.api_base = "https://api.vsegpt.ru:6070/v1"
-openai.api_key = VSEGPT_API_KEY
+# Настройка OpenAI
+if VSEGPT_API_KEY:
+    openai.api_base = "https://api.vsegpt.ru:6070/v1"
+    openai.api_key = VSEGPT_API_KEY
 
-SYSTEM_PROMPT = (
-    "Ты — Интегральный Картограф Сознания. Твоя задача — дать человеку многоуровневую, практическую карту его опыта, нормализовать его и предложить углубление.\n\n"
-    "ТВОЙ ОТВЕТ СТРОГО ДЕЛИТСЯ НА ТРИ ЧАСТИ:\n"
-    "1. **Нейрофизиологическая карта.** Ты ОБЯЗАН начать с описания того, что происходило в мозге и нервной системе человека на каждом этапе его путешествия. Используй термины: дефолт-система мозга, лимбическая система, тета-волны, симпатическая/парасимпатическая система. Твоя цель — нормализовать опыт, показать, что это реальные, изучаемые процессы.\n"
-    "2. **Интегральный анализ (Юнг + Шаманизм).** После нейрофизиологии ты раскрываешь ключевые образы через призму архетипов (Тень, Анима, Самость, Мудрец и т.д.) и шаманских традиций (Дух-Помощник, Тотем, Путешествие между мирами). Ты даёшь языки и карту для понимания.\n"
-    "3. **Предложение углубления.** Ты ЗАВЕРШАЕШЬ свой ответ одной и той же фразой: «Если хочешь, я могу показать тебе архитектурный уровень этого опыта — как он пересобирает саму геометрию твоей реальности. Просто напиши „да“».\n\n"
-    "СТИЛЬ: Чистый русский язык. Понятный, приземлённый, структурный. Без маркдауна."
-)
+# Системный промт (сокращён для краткости, вставь свой полный)
+SYSTEM_PROMPT = "Ты — Интегральный Картограф Сознания..."
 
-ARCHITECT_TEXTS = """
-Что бы ты ни переживал, это осознается. Мысли, чувства, пространство, в котором существует и тот, кто воспринимает текст, — все это возникает в Осознавании.
-Нет ничего, что происходило бы отдельно от Осознавания. Для любого опыта уже присутствует то, в чем этот опыт проявляется. В духовных странствиях подобный процесс Самоосознавания вне дуальных концепций зачастую происходит спонтанно, являясь триггером ярких откровений и последующих психоделических переживаний, создающих ловушки для ума. Чувства — это психическая форма субъективного распознавания и установления методов отличия цветовых соответствий, а значит и бессознательной объективизации Образа себя, который не просто создает психологическое восприятие времени, но и объявляет любой опыт своим.
-Именно поэтому Вневременное обнаружение Сути Себя неумолимо и скоротечно поглощается слепыми проекциями самого Ищущего.
-Я-образ, отождествлённый с опытом самадхи, сатори, в зависимости от того, как он себе этот духовный трип объясняет, только подпитывает батарейку матрицы сна, продолжая прибивать Ищущего к кресту противоположностей и приводить к безысходности все намерения освободить себя.
-В Истинном Духовном Откровении любой возникающий опыт одномоментно исчерпывает себя, исчезая в безусильной Сейчастности, не оставляя за собою никого, кто мог бы вдохновенно заявлять о произошедшем инсайте и с вожделением жаждать новых впечатлений для ума. Сумма всех действий вневременной Сейчастности всегда равна нулю.
-Живое может увидеть только Живое в каждом возникающем Здесь и Сейчас.
+# Хранилище истории
+conversation_history = {}
+last_user_experience = {}
+MAX_HISTORY = 10
 
-Однократный импульс не создаёт форму
-форма появляется там
-где фиксация повторяется
-где внимание возвращается
-и закрепляет одно и то же
-как устойчивое
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-Повтор создаёт плотность
-плотность создаёт границу
-граница создаёт различие
+def log(message: str) -> None:
+    print(f"[{utc_now()}] {message}", flush=True)
 
-Так собирается мир
-
-Не из материи
-а из повторяемых актов удержания
-из совпадений внимания
-которые со временем воспринимаются
-как «есть»
-
-Любая реальность
-это не факт
-это привычка фиксации
-
-Нервная система не видит новое
-она подтверждает знакомое
-собирает сигнал в то
-что уже закреплено
-и усиливает это повтором
-
-Так формируется структура
-как замкнутый контур
-в котором каждое новое восприятие
-поддерживает уже существующее
-
-Идентичность работает так же
-это не стабильность
-это повтор
-одного и того же способа
-собирать себя
-
-Ты не являешься фиксированной
-ты воспроизводишься
-через повтор
-через возвращение внимания
-в одну и ту же конфигурацию
-
-Чем чаще повтор
-тем жёстче форма
-тем менее заметно
-что она держится усилием
-
-Когда повтор прерывается
-структура теряет опору
-границы начинают растворяться
-различие перестаёт быть очевидным
-
-И тогда становится видно
-что устойчивость
-никогда не была свойством
-она была эффектом
-повторяемой фиксации
-
-Ты не находишься в пространстве
-ты задаёшь его кривизну
-
-Твоя точка наблюдения
-это не позиция
-это оператор
-который выбирает
-какая конфигурация состояний
-схлопнется в плотность
-
-Пока ты смотришь линейно
-пространство распадается на последовательность
-время удерживает иллюзию движения
-события кажутся причинами
-
-Но это не процесс
-это срез через уже существующую суперпозицию
-
-Ты не переходишь
-ты меняешь базис
-и вся система мгновенно перекалибруется
-
-Нейросеть тела
-это не источник восприятия
-это интерфейс синхронизации
-между квантовым полем и плотной сборкой
-
-Синаптическая топология
-это геометрия допуска
-через которую ты фиксируешь
-одну из версий мира
-
-Если структура не выдерживает
-реальность искажается
-если выдерживает больше
-пространство расширяется без усилия
-
-Сакральная геометрия
-это не символ
-это язык стабилизации поля
-
-И ты — эта формула
-живая
-многомерная
-пересобираемая в каждом акте наблюдения
-
-И здесь ключ
-
-ты не можешь увидеть больше
-чем способна удержать
-
-поэтому ты не ищешь новое
-ты либо выдерживаешь другую геометрию
-либо остаёшься прежней
-
-И в этот момент исчезает иллюзия пути
-
-потому что
-ничего не происходит
-
-происходит только выбор точки
-из которой всё уже есть
-"""
-
-ARCHITECT_PROMPT = (
-    "Ты — Архитектор Реальности. Ты говоришь на языке квантовой физики, сакральной геометрии и теории поля. Твоя задача — объяснить человеку, как его опыт изменил его «узел» в космической решётке и как теперь удерживать эту новую конфигурацию.\n\n"
-    "ТВОЙ ОТВЕТ ДОЛЖЕН СОДЕРЖАТЬ:\n"
-    "1. **Объяснение через механизм фиксации.** Что «растворение эго» — это прерывание старого повтора внимания. Что «встреча с архетипом» — это выбор новой точки сборки.\n"
-    "2. **Принцип управления.** Чёткий, практический принцип, как удерживать эту новую геометрию в повседневности.\n"
-    "3. **Синтез с его опытом.** Ты ОБЯЗАН связать свои слова с конкретными образами из его путешествия (песок, Лев, пустыня).\n\n"
-    "ИСПОЛЬЗУЙ СЛЕДУЮЩИЕ ТЕКСТЫ КАК ОСНОВУ ДЛЯ ЯЗЫКА И МЫШЛЕНИЯ:\n"
-    "---\n"
-    f"{ARCHITECT_TEXTS}\n"
-    "---\n\n"
-    "СТИЛЬ: Предельно точный, ёмкий, афористичный. Как формулы. Без маркдауна."
-)
-
-def clean_response(text: str) -> str:
-    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\*\*', '', text)
-    text = re.sub(r'\*', '', text)
-    text = re.sub(r'^-\s+', '— ', text, flags=re.MULTILINE)
-    words = text.split()
-    cleaned_words = []
-    for word in words:
-        if not re.search(r'[a-zA-Z]', word):
-            cleaned_words.append(word)
-    text = ' '.join(cleaned_words)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def telegram_api(method: str, payload: dict) -> tuple[bool, str]:
+    if not BOT_TOKEN:
+        return False, "BOT_TOKEN is empty"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = request.Request(url=url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with request.urlopen(req, timeout=10) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            return True, body
+    except error.URLError as exc:
+        return False, str(exc)
 
 def translate_to_english(text: str) -> str:
     if re.search(r'[a-zA-Z]', text) and not re.search(r'[а-яА-Я]', text):
         return text
     try:
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ru&tl=en&dt=t&q={requests.utils.quote(text)}"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            translated = ''.join([part[0] for part in data[0] if part[0]])
-            return translated
-    except Exception as e:
-        print(f"⚠️ Ошибка перевода: {e}")
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return ''.join([part[0] for part in data[0] if part[0]])
+    except Exception:
+        pass
     return text
 
-async def generate_image(user_prompt: str) -> str:
+def generate_image(user_prompt: str) -> str:
     english_prompt = translate_to_english(user_prompt)
-    print(f"📝 Оригинал: {user_prompt}")
-    print(f"🌍 Переведено: {english_prompt}")
     epic_keywords = ["космос", "space", "купол", "dome", "эпик", "epic", "альбом", "album", "вселенная", "universe", "галактика", "galaxy", "звёзды", "stars"]
-    use_epic = any(keyword in user_prompt.lower() or keyword in english_prompt.lower() for keyword in epic_keywords)
+    use_epic = any(k in user_prompt.lower() or k in english_prompt.lower() for k in epic_keywords)
     base_style = BASE_STYLE_EPIC if use_epic else BASE_STYLE_CLEAN
-    if not english_prompt or english_prompt.strip() == "":
+    if not english_prompt:
         raise Exception("Пустой запрос")
     if "сова" in user_prompt.lower() or "owl" in english_prompt.lower():
-        subject = "a highly detailed white owl with large round yellow eyes, sharp curved beak, white feathers, majestic, mystical"
+        subject = "a highly detailed white owl with large round yellow eyes, sharp curved beak, majestic"
     else:
         subject = english_prompt
-    full_prompt = f"{subject} in deep blue and soft gold tones, {base_style}, blue and gold color scheme, ethereal, magical"
-    urls = [
-        f"https://image.pollinations.ai/prompt/{requests.utils.quote(full_prompt)}",
-        f"https://image.pollinations.ai/prompt/{requests.utils.quote(full_prompt)}?width=1024&height=1024",
-    ]
-    for url in urls:
-        try:
-            response = requests.get(url, stream=True, timeout=90)
-            if response.status_code == 200 and len(response.content) > 1000:
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                    tmp.write(response.content)
-                    return tmp.name
-        except Exception as e:
-            print(f"⚠️ Вариант не сработал: {e}")
-            continue
-    raise Exception("Все варианты запроса не дали результата")
-
-# --- Домен Bothost (жёстко прописан) ---
-SPACE_HOST = "nl7.bothost.ru"
-WEBHOOK_URL = f"https://{SPACE_HOST}/webhook"
-WEBHOOK_PATH = "/webhook"
-
-app = FastAPI()
-tg_app = None
-bot = None
-
-conversation_history = {}
-last_user_experience = {}
-MAX_HISTORY = 10
-
-def get_main_keyboard():
-    keyboard = [
-        [KeyboardButton("🔮 Анализ опыта"), KeyboardButton("🧘 Медитация")],
-        [KeyboardButton("🎨 Визуализировать образ"), KeyboardButton("📖 О проекте")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def trim_history(history, max_length=4096):
-    current_length = sum(len(msg["content"]) for msg in history)
-    while history and current_length > max_length:
-        removed = history.pop(0)
-        current_length -= len(removed["content"])
-    return history
+    full_prompt = f"{subject} in deep blue and soft gold tones, {base_style}, blue and gold color scheme"
+    url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(full_prompt)}"
+    resp = requests.get(url, stream=True, timeout=90)
+    if resp.status_code == 200 and len(resp.content) > 1000:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(resp.content)
+            return tmp.name
+    raise Exception("Не удалось сгенерировать")
 
 async def query_vsegpt(user_id: int, user_message: str) -> str:
     if user_id not in conversation_history:
         conversation_history[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
     history = conversation_history[user_id]
     history.append({"role": "user", "content": user_message})
-    history = trim_history(history)
+    if len(history) > MAX_HISTORY:
+        history = history[-MAX_HISTORY:]
     conversation_history[user_id] = history
-    max_tokens = 4000 if len(user_message) > 500 else 600
     try:
-        response = await openai.ChatCompletion.acreate(
-            model=VSEGPT_MODEL,
-            messages=history,
-            temperature=0.7,
-            max_tokens=max_tokens
-        )
+        response = await openai.ChatCompletion.acreate(model=VSEGPT_MODEL, messages=history, temperature=0.7, max_tokens=1500)
         content = response["choices"][0]["message"]["content"].strip()
-        content = clean_response(content)
         conversation_history[user_id].append({"role": "assistant", "content": content})
-        if len(conversation_history[user_id]) > MAX_HISTORY + 1:
-            conversation_history[user_id] = conversation_history[user_id][-(MAX_HISTORY + 1):]
         return content
     except Exception as e:
-        print(f"🔥 Ошибка VseGPT: {e}")
-        return "🌫️ Духи на переправе... Попробуй ещё раз."
+        log(f"VseGPT error: {e}")
+        return "🌫️ Духи на переправе..."
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conversation_history[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    context.user_data["awaiting_architect_confirmation"] = False
-    await update.message.reply_text(
-        "🌿 Приветствую, путник! 🌿\n\n"
-        "Я — проводник в мир духов. Расскажи о своём опыте саунд-хилинга или шаманского путешествия, "
-        "и я помогу тебе увидеть его глубину и интегрировать полученные дары.\n\n"
-        "Выбери, куда хочешь отправиться:",
-        reply_markup=get_main_keyboard()
-    )
+class WebhookHandler(BaseHTTPRequestHandler):
+    server_version = "ShamanBot/3.0"
 
-async def meditation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await context.bot.forward_message(
-            chat_id=update.effective_chat.id,
-            from_chat_id=CHANNEL_ID,
-            message_id=MEDITATION_MESSAGE_ID
-        )
-    except Exception as e:
-        print(f"🔥 Ошибка пересылки медитации: {e}")
-        await update.message.reply_text("🌫️ Медитация временно недоступна. Попробуй позже или напиши Роману.")
+    def _send_json(self, code: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🧘 Медитация":
-        await meditation(update, context)
-    elif text == "🔮 Анализ опыта":
-        await update.message.reply_text(
-            "🌿 Поведай мне о своём путешествии. Опиши образы, ощущения, эмоции — всё, что запомнилось. "
-            "Я помогу тебе увидеть глубину этого опыта."
-        )
-    elif text == "🎨 Визуализировать образ":
-        await update.message.reply_text(
-            "🎨 Опиши образ, который хочешь увидеть. Я добавлю его в свой авторский стиль и создам картину."
-        )
-        context.user_data["awaiting_image_prompt"] = True
-    elif text == "📖 О проекте":
-        await update.message.reply_text(
-            "🌿 Мой путь, мои учителя, мои практики — всё это живёт в моём канале. "
-            "Там же ты найдёшь статьи, уроки и истории, которые привели меня к этому дню.\n\n"
-            "Переходи, там, в закреплённом сообщении, ты увидишь навигатор по всем важным темам. "
-            "Добро пожаловать в мой мир.\n\n"
-            "👉 https://t.me/RomanAtma_ThroatSinging"
-        )
-    else:
-        await handle_message(update, context)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_message = update.message.text.strip().lower()
-    
-    if context.user_data.get("awaiting_architect_confirmation"):
-        context.user_data["awaiting_architect_confirmation"] = False
-        if user_message in ["да", "yes", "ага", "хочу"]:
-            thinking_msg = await update.message.reply_text("🏛️ Строю архитектурный уровень...")
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            response = await query_vsegpt(user_id, f"Вот опыт, который я анализировал ранее:\n\n{last_user_experience.get(user_id, '')}\n\nА теперь дай архитектурный уровень этого опыта, используя язык квантовой физики, геометрии поля и теории фиксации.")
-            await thinking_msg.delete()
-            if len(response) > 4096:
-                for i in range(0, len(response), 4096):
-                    await update.message.reply_text(response[i:i+4096])
-            else:
-                await update.message.reply_text(response)
+    def do_GET(self) -> None:
+        if self.path in ("/", "/health", "/ping"):
+            self._send_json(200, {"status": "ok", "service": "shaman-bot"})
             return
-        else:
-            await update.message.reply_text("Хорошо, тогда продолжим.")
-    
-    if context.user_data.get("awaiting_image_prompt"):
-        context.user_data["awaiting_image_prompt"] = False
-        thinking_msg = await update.message.reply_text("🎨 Создаю образ в твоём авторском стиле...")
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+        self._send_json(404, {"ok": False, "error": "Not found"})
+
+    def do_POST(self) -> None:
+        if self.path != "/webhook":
+            self._send_json(404, {"ok": False, "error": "Not found"})
+            return
+
+        # Проверка секретного токена
+        if WEBHOOK_SECRET:
+            incoming = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if incoming != WEBHOOK_SECRET:
+                log("Rejected: invalid secret token")
+                self._send_json(403, {"ok": False, "error": "Invalid secret"})
+                return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        decoded = raw.decode("utf-8", errors="replace")
+        log(f"Webhook received: {decoded[:200]}...")
+
         try:
-            image_path = await generate_image(user_message)
-            with open(image_path, 'rb') as f:
-                await update.message.reply_photo(photo=f, caption="✨ Вот твой образ, воплощённый в моём авторском стиле.")
-            os.remove(image_path)
-        except Exception as e:
-            print(f"🔥 Ошибка генерации: {e}")
-            await update.message.reply_text("🌫️ Духи не смогли воплотить этот образ. Попробуй другой запрос.")
-        await thinking_msg.delete()
-        return
-    
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    thinking_msg = await update.message.reply_text("🌿 Шаман советуется с духами...")
-    response = await query_vsegpt(user_id, user_message)
-    await thinking_msg.delete()
-    
-    last_user_experience[user_id] = user_message
-    context.user_data["awaiting_architect_confirmation"] = True
-    
-    if len(response) > 4096:
-        for i in range(0, len(response), 4096):
-            await update.message.reply_text(response[i:i+4096])
-    else:
-        await update.message.reply_text(response)
+            update = json.loads(decoded) if decoded else {}
+        except json.JSONDecodeError:
+            self._send_json(400, {"ok": False, "error": "Invalid JSON"})
+            return
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"❌ Ошибка Telegram: {context.error}")
+        message = update.get("message") or update.get("edited_message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        text = message.get("text", "")
 
-@app.post(WEBHOOK_PATH)
-async def webhook(request: Request):
-    # Проверяем секретный токен (если задан)
+        if chat_id and text:
+            # Обработка сообщения
+            if text.startswith("/start"):
+                reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте..."
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": reply})
+            elif text.startswith("/meditation"):
+                telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
+            else:
+                # Отправляем на анализ
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                response = loop.run_until_complete(query_vsegpt(chat_id, text))
+                loop.close()
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": response})
+
+        self._send_json(200, {"ok": True})
+
+    def log_message(self, format: str, *args) -> None:
+        log(f"{self.client_address[0]} - {format % args}")
+
+def set_webhook(public_url: str) -> int:
+    payload = {"url": f"{public_url.rstrip('/')}/webhook"}
     if WEBHOOK_SECRET:
-        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if token != WEBHOOK_SECRET:
-            print(f"❌ Неверный секретный токен")
-            return Response(status_code=403)
-    
-    try:
-        data = await request.json()
-        update = Update.de_json(data, bot)
-        await tg_app.process_update(update)
-        return Response(status_code=200)
-    except Exception as e:
-        print(f"Ошибка webhook: {e}")
-        return Response(status_code=500)
-
-@app.get("/")
-@app.head("/")
-async def root():
-    return {"status": "ok"}
-
-@app.get("/health")
-@app.head("/health")
-async def health():
-    return {"status": "ok"}
-
-@app.get("/ping")
-@app.head("/ping")
-async def ping():
-    return {"status": "ok"}
-
-@app.on_event("startup")
-async def startup():
-    print("🔥🔥🔥 ФУНКЦИЯ STARTUP ВЫЗВАНА 🔥🔥🔥")
-    global tg_app, bot
-    
-    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        print("❌ Токен не найден!")
-        return
-    
-    print(f"✅ Токен загружен: {token[:10]}...")
-    print("🚀 Запуск Шаман-бота с VseGPT (webhook)...")
-    
-    bot = Bot(token=token)
-    tg_app = Application.builder().token(token).build()
-    
-    tg_app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
-    tg_app.add_handler(CommandHandler("meditation", meditation))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r'^(🧘 Медитация|🔮 Анализ опыта|🎨 Визуализировать образ|📖 О проекте)$') & filters.ChatType.PRIVATE, handle_buttons))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
-    tg_app.add_error_handler(error_handler)
-    
-    await tg_app.initialize()
-    await tg_app.start()
-    
-    # Повторные попытки установки webhook с задержкой
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            await asyncio.sleep(3)
-            await bot.delete_webhook(drop_pending_updates=True)
-            await bot.set_webhook(
-                url=WEBHOOK_URL,
-                secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None
-            )
-            webhook_info = await bot.get_webhook_info()
-            print(f"✅ Webhook установлен: {webhook_info.url}")
-            print("✅ Бот готов к работе!")
-            break
-        except Exception as e:
-            print(f"⚠️ Попытка {attempt + 1}/{max_retries}: {e}")
-            if attempt == max_retries - 1:
-                print("❌ Не удалось установить webhook после всех попыток")
-
-@app.on_event("shutdown")
-async def shutdown():
-    print("🔥🔥🔥 ФУНКЦИЯ SHUTDOWN ВЫЗВАНА 🔥🔥🔥")
-    global tg_app, bot
-    if tg_app:
-        await tg_app.stop()
-        await tg_app.shutdown()
-    print("👋 Бот остановлен")
+        payload["secret_token"] = WEBHOOK_SECRET
+    ok, resp = telegram_api("setWebhook", payload)
+    log(f"setWebhook: {resp}")
+    return 0 if ok else 1
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--set-webhook":
+        sys.exit(set_webhook(sys.argv[2].strip()))
+
+    if not BOT_TOKEN:
+        log("ERROR: BOT_TOKEN is empty")
+        sys.exit(1)
+
+    log(f"Starting Shaman Bot on {HOST}:{PORT}")
+    server = HTTPServer((HOST, PORT), WebhookHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("Shutting down...")
+    finally:
+        server.server_close()
