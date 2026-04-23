@@ -3,6 +3,7 @@ import json
 import sys
 import re
 import tempfile
+import asyncio
 import openai
 import requests
 from datetime import datetime, timezone
@@ -11,14 +12,18 @@ from urllib import error, request
 
 # --- Конфигурация ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY", "").strip()
+VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY") or os.getenv("VSEGPT_A_PI_KEY", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "3000"))
 VSEGPT_MODEL = "deepseek/deepseek-chat"
-
 CHANNEL_ID = -1002677656270
 MEDITATION_MESSAGE_ID = 222
+
+if not VSEGPT_API_KEY:
+    print("❌ VSEGPT_API_KEY не найден!")
+else:
+    print(f"✅ VSEGPT_API_KEY загружен: {VSEGPT_API_KEY[:20]}...")
 
 BASE_STYLE_CLEAN = (
     "fairy-tale illustration, ethereal magical dreamlike atmosphere, "
@@ -43,6 +48,7 @@ if VSEGPT_API_KEY:
 
 conversation_history = {}
 last_user_experience = {}
+awaiting_architect = {}
 MAX_HISTORY = 10
 
 SYSTEM_PROMPT = (
@@ -52,6 +58,13 @@ SYSTEM_PROMPT = (
     "2. **Интегральный анализ (Юнг + Шаманизм).** После нейрофизиологии ты раскрываешь ключевые образы через призму архетипов (Тень, Анима, Самость, Мудрец и т.д.) и шаманских традиций (Дух-Помощник, Тотем, Путешествие между мирами). Ты даёшь языки и карту для понимания.\n"
     "3. **Предложение углубления.** Ты ЗАВЕРШАЕШЬ свой ответ одной и той же фразой: «Если хочешь, я могу показать тебе архитектурный уровень этого опыта — как он пересобирает саму геометрию твоей реальности. Просто напиши „да“».\n\n"
     "СТИЛЬ: Чистый русский язык. Понятный, приземлённый, структурный. Без маркдауна."
+)
+
+ARCHITECT_PROMPT = (
+    "Ты — Архитектор Реальности. Ты говоришь на языке квантовой физики, сакральной геометрии и теории поля. "
+    "Объясни человеку, как его опыт изменил его «узел» в космической решётке и как теперь удерживать эту новую конфигурацию. "
+    "Используй термины: повтор, фиксация внимания, геометрия поля, суперпозиция, синаптическая топология. "
+    "Стиль: точный, ёмкий, без воды."
 )
 
 def utc_now() -> str:
@@ -106,8 +119,6 @@ def generate_image(user_prompt: str) -> str:
             return tmp.name
     raise Exception("Не удалось сгенерировать")
 
-import asyncio
-
 async def query_vsegpt(user_id: int, user_message: str) -> str:
     if user_id not in conversation_history:
         conversation_history[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -126,7 +137,7 @@ async def query_vsegpt(user_id: int, user_message: str) -> str:
         return "🌫️ Духи на переправе..."
 
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/3.0"
+    server_version = "ShamanBot/5.0"
 
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -168,33 +179,78 @@ class WebhookHandler(BaseHTTPRequestHandler):
         message = update.get("message") or update.get("edited_message") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
-        text = message.get("text", "")
+        text = message.get("text", "").strip()
+        voice = message.get("voice")
 
         if chat_id and text:
-            if text.startswith("/start"):
-                reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте..."
+            # Проверка на архитектурный уровень
+            if awaiting_architect.get(chat_id) and text.lower() in ["да", "yes", "ага", "хочу", "lf"]:
+                awaiting_architect[chat_id] = False
+                safe_log(f"Architect level triggered for {chat_id}")
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🏛️ Строю архитектурный уровень..."})
+                
+                original = last_user_experience.get(chat_id, text)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    # Используем архитектурный промт
+                    temp_history = [
+                        {"role": "system", "content": ARCHITECT_PROMPT},
+                        {"role": "user", "content": f"Опыт: {original}\n\nДай архитектурный уровень."}
+                    ]
+                    response = loop.run_until_complete(
+                        openai.ChatCompletion.acreate(model=VSEGPT_MODEL, messages=temp_history, temperature=0.7, max_tokens=1500)
+                    )
+                    arch_response = response["choices"][0]["message"]["content"].strip()
+                except Exception as e:
+                    arch_response = f"🌫️ Ошибка архитектурного уровня: {e}"
+                loop.close()
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": arch_response})
+                self._send_json(200, {"ok": True})
+                return
+
+            elif text.startswith("/start"):
+                reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте...\n\n/art [описание] — сгенерировать картинку\n/meditation — получить медитацию"
                 telegram_api("sendMessage", {"chat_id": chat_id, "text": reply})
+
             elif text.startswith("/meditation"):
                 telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
+
+            elif text.startswith("/art"):
+                prompt = text.replace("/art", "").strip()
+                if not prompt:
+                    telegram_api("sendMessage", {"chat_id": chat_id, "text": "🎨 Пожалуйста, опиши образ после /art"})
+                else:
+                    telegram_api("sendMessage", {"chat_id": chat_id, "text": "🎨 Создаю образ..."})
+                    try:
+                        image_path = generate_image(prompt)
+                        with open(image_path, "rb") as img:
+                            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+                            files = {"photo": img}
+                            data = {"chat_id": chat_id, "caption": f"✨ {prompt}"}
+                            requests.post(url, files=files, data=data)
+                        os.remove(image_path)
+                    except Exception as e:
+                        safe_log(f"Image error: {e}")
+                        telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌫️ Не удалось создать образ."})
+
             else:
+                # Обычный анализ
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌿 Шаман советуется с духами..."})
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 response = loop.run_until_complete(query_vsegpt(chat_id, text))
                 loop.close()
                 telegram_api("sendMessage", {"chat_id": chat_id, "text": response})
+                
+                # Сохраняем опыт и устанавливаем флаг ожидания "да"
+                last_user_experience[chat_id] = text
+                awaiting_architect[chat_id] = True
 
         self._send_json(200, {"ok": True})
 
     def log_message(self, format: str, *args) -> None:
         safe_log(f"{self.client_address[0]} - {format % args}")
-
-def set_webhook(public_url: str) -> int:
-    payload = {"url": f"{public_url.rstrip('/')}/webhook"}
-    if WEBHOOK_SECRET:
-        payload["secret_token"] = WEBHOOK_SECRET
-    ok, resp = telegram_api("setWebhook", payload)
-    safe_log(f"setWebhook: {resp}")
-    return 0 if ok else 1
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
