@@ -414,6 +414,7 @@ def main():
 
 
 if __name__ == "__main__":
+    
     main()def send_message(chat_id: int, text: str) -> None:
     """Отправляет сообщение, разбивая длинные на части."""
     if len(text) > 4000:
