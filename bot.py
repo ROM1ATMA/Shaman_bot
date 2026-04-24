@@ -135,13 +135,37 @@ async def query_vsegpt(user_id: int, user_message: str) -> str:
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
     conversation_history[user_id] = history
+    
     try:
-        response = await openai.ChatCompletion.acreate(model=VSEGPT_MODEL, messages=history, temperature=0.7, max_tokens=1500)
-        content = response["choices"][0]["message"]["content"].strip()
-        conversation_history[user_id].append({"role": "assistant", "content": content})
-        return content
+        safe_log(f"🔍 Отправляю запрос к VseGPT...")
+        
+        # Прямой HTTP-запрос
+        url = "https://api.vsegpt.ru:6070/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {VSEGPT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": VSEGPT_MODEL,
+            "messages": history,
+            "temperature": 0.7,
+            "max_tokens": 1500
+        }
+        
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        safe_log(f"🔍 VseGPT статус: {resp.status_code}")
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"].strip()
+            safe_log(f"✅ VseGPT ответил: {content[:100]}...")
+            conversation_history[user_id].append({"role": "assistant", "content": content})
+            return content
+        else:
+            safe_log(f"🔥 VseGPT error: {resp.status_code} - {resp.text[:200]}")
+            return f"🌫️ Ошибка VseGPT ({resp.status_code})"
     except Exception as e:
-        safe_log(f"VseGPT error: {e}")
+        safe_log(f"🔥 VseGPT exception: {e}")
         return "🌫️ Духи на переправе..."
 
 class WebhookHandler(BaseHTTPRequestHandler):
