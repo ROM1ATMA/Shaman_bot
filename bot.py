@@ -73,6 +73,14 @@ def utc_now() -> str:
 def safe_log(message: str) -> None:
     print(f"[{utc_now()}] {message}", flush=True)
 
+def send_message(chat_id: int, text: str) -> None:
+    """Отправляет сообщение, разбивая длинные на части."""
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            telegram_api("sendMessage", {"chat_id": chat_id, "text": text[i:i+4000]})
+    else:
+        telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
+
 def telegram_api(method: str, payload: dict) -> tuple[bool, str]:
     if not BOT_TOKEN:
         return False, "BOT_TOKEN is empty"
@@ -137,7 +145,7 @@ async def query_vsegpt(user_id: int, user_message: str) -> str:
         return "🌫️ Духи на переправе..."
 
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/6.0"
+    server_version = "ShamanBot/7.0"
 
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -182,11 +190,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
         text = message.get("text", "").strip()
 
         if chat_id and text:
-            # Проверка на архитектурный уровень
+            # Архитектурный уровень
             if awaiting_architect.get(chat_id) and text.lower() in ["да", "yes", "ага", "хочу", "lf"]:
                 awaiting_architect[chat_id] = False
                 safe_log(f"Architect level triggered for {chat_id}")
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🏛️ Строю архитектурный уровень..."})
+                send_message(chat_id, "🏛️ Строю архитектурный уровень...")
                 
                 original = last_user_experience.get(chat_id, text)
                 loop = asyncio.new_event_loop()
@@ -203,11 +211,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     arch_response = f"🌫️ Ошибка архитектурного уровня: {e}"
                 loop.close()
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": arch_response})
+                send_message(chat_id, arch_response)
                 self._send_json(200, {"ok": True})
                 return
 
-            # Команда /start с кнопочным меню
+            # /start
             elif text == "/start":
                 reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте саунд-хилинга или шаманского путешествия, и я помогу тебе увидеть его глубину и интегрировать полученные дары.\n\nВыбери, куда хочешь отправиться:"
                 keyboard = {
@@ -223,27 +231,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     "reply_markup": json.dumps(keyboard)
                 })
 
-            # Обработка кнопок меню
+            # Кнопки меню
             elif text == "🧘 Медитация":
                 telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
 
             elif text == "🔮 Анализ опыта":
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌿 Поведай мне о своём путешествии. Опиши образы, ощущения, эмоции — всё, что запомнилось. Я помогу тебе увидеть глубину этого опыта."})
+                send_message(chat_id, "🌿 Поведай мне о своём путешествии. Опиши образы, ощущения, эмоции — всё, что запомнилось. Я помогу тебе увидеть глубину этого опыта.")
 
             elif text == "🎨 Визуализировать образ":
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🎨 Опиши образ, который хочешь увидеть. Я добавлю его в свой авторский стиль и создам картину."})
+                send_message(chat_id, "🎨 Опиши образ, который хочешь увидеть. Я добавлю его в свой авторский стиль и создам картину.")
 
             elif text == "📖 О проекте":
                 reply = "🌿 Мой путь, мои учителя, мои практики — всё это живёт в моём канале. Там же ты найдёшь статьи, уроки и истории, которые привели меня к этому дню.\n\nПереходи, там, в закреплённом сообщении, ты увидишь навигатор по всем важным темам. Добро пожаловать в мой мир.\n\n👉 https://t.me/RomanAtma_ThroatSinging"
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": reply})
+                send_message(chat_id, reply)
 
-            # Команда /art
+            # /art
             elif text.startswith("/art"):
                 prompt = text.replace("/art", "").strip()
                 if not prompt:
-                    telegram_api("sendMessage", {"chat_id": chat_id, "text": "🎨 Пожалуйста, опиши образ после /art"})
+                    send_message(chat_id, "🎨 Пожалуйста, опиши образ после /art")
                 else:
-                    telegram_api("sendMessage", {"chat_id": chat_id, "text": "🎨 Создаю образ..."})
+                    send_message(chat_id, "🎨 Создаю образ...")
                     try:
                         image_path = generate_image(prompt)
                         with open(image_path, "rb") as img:
@@ -254,16 +262,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         os.remove(image_path)
                     except Exception as e:
                         safe_log(f"Image error: {e}")
-                        telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌫️ Не удалось создать образ."})
+                        send_message(chat_id, "🌫️ Не удалось создать образ.")
 
             # Обычный анализ
             else:
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌿 Шаман советуется с духами..."})
+                send_message(chat_id, "🌿 Шаман советуется с духами...")
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 response = loop.run_until_complete(query_vsegpt(chat_id, text))
                 loop.close()
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": response})
+                send_message(chat_id, response)
                 
                 last_user_experience[chat_id] = text
                 awaiting_architect[chat_id] = True
