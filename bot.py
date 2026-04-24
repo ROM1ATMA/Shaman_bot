@@ -137,7 +137,7 @@ async def query_vsegpt(user_id: int, user_message: str) -> str:
         return "🌫️ Духи на переправе..."
 
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/5.0"
+    server_version = "ShamanBot/6.0"
 
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -180,7 +180,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         text = message.get("text", "").strip()
-        voice = message.get("voice")
 
         if chat_id and text:
             # Проверка на архитектурный уровень
@@ -193,7 +192,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    # Используем архитектурный промт
                     temp_history = [
                         {"role": "system", "content": ARCHITECT_PROMPT},
                         {"role": "user", "content": f"Опыт: {original}\n\nДай архитектурный уровень."}
@@ -209,13 +207,37 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True})
                 return
 
-            elif text.startswith("/start"):
-                reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте...\n\n/art [описание] — сгенерировать картинку\n/meditation — получить медитацию"
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": reply})
+            # Команда /start с кнопочным меню
+            elif text == "/start":
+                reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте саунд-хилинга или шаманского путешествия, и я помогу тебе увидеть его глубину и интегрировать полученные дары.\n\nВыбери, куда хочешь отправиться:"
+                keyboard = {
+                    "keyboard": [
+                        [{"text": "🔮 Анализ опыта"}, {"text": "🧘 Медитация"}],
+                        [{"text": "🎨 Визуализировать образ"}, {"text": "📖 О проекте"}]
+                    ],
+                    "resize_keyboard": True
+                }
+                telegram_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": reply,
+                    "reply_markup": json.dumps(keyboard)
+                })
 
-            elif text.startswith("/meditation"):
+            # Обработка кнопок меню
+            elif text == "🧘 Медитация":
                 telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
 
+            elif text == "🔮 Анализ опыта":
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌿 Поведай мне о своём путешествии. Опиши образы, ощущения, эмоции — всё, что запомнилось. Я помогу тебе увидеть глубину этого опыта."})
+
+            elif text == "🎨 Визуализировать образ":
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": "🎨 Опиши образ, который хочешь увидеть. Я добавлю его в свой авторский стиль и создам картину."})
+
+            elif text == "📖 О проекте":
+                reply = "🌿 Мой путь, мои учителя, мои практики — всё это живёт в моём канале. Там же ты найдёшь статьи, уроки и истории, которые привели меня к этому дню.\n\nПереходи, там, в закреплённом сообщении, ты увидишь навигатор по всем важным темам. Добро пожаловать в мой мир.\n\n👉 https://t.me/RomanAtma_ThroatSinging"
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": reply})
+
+            # Команда /art
             elif text.startswith("/art"):
                 prompt = text.replace("/art", "").strip()
                 if not prompt:
@@ -234,8 +256,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         safe_log(f"Image error: {e}")
                         telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌫️ Не удалось создать образ."})
 
+            # Обычный анализ
             else:
-                # Обычный анализ
                 telegram_api("sendMessage", {"chat_id": chat_id, "text": "🌿 Шаман советуется с духами..."})
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -243,7 +265,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 loop.close()
                 telegram_api("sendMessage", {"chat_id": chat_id, "text": response})
                 
-                # Сохраняем опыт и устанавливаем флаг ожидания "да"
                 last_user_experience[chat_id] = text
                 awaiting_architect[chat_id] = True
 
