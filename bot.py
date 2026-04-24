@@ -44,6 +44,7 @@ BASE_STYLE_EPIC = (
 conversation_history = {}
 last_user_experience = {}
 awaiting_architect = {}
+awaiting_image = {}
 MAX_HISTORY = 10
 
 SYSTEM_PROMPT = (
@@ -52,6 +53,9 @@ SYSTEM_PROMPT = (
     "1. **Нейрофизиологическая карта.** Ты ОБЯЗАН начать с описания того, что происходило в мозге и нервной системе человека на каждом этапе его путешествия. Используй термины: дефолт-система мозга, лимбическая система, тета-волны, симпатическая/парасимпатическая система. Твоя цель — нормализовать опыт, показать, что это реальные, изучаемые процессы.\n"
     "2. **Интегральный анализ (Юнг + Шаманизм).** После нейрофизиологии ты раскрываешь ключевые образы через призму архетипов (Тень, Анима, Самость, Мудрец и т.д.) и шаманских традиций (Дух-Помощник, Тотем, Путешествие между мирами). Ты даёшь языки и карту для понимания.\n"
     "3. **Предложение углубления.** Ты ЗАВЕРШАЕШЬ свой ответ одной и той же фразой: «Если хочешь, я могу показать тебе архитектурный уровень этого опыта — как он пересобирает саму геометрию твоей реальности. Просто напиши „да“».\n\n"
+    "ВАЖНО: При интерпретации образов ВСЕГДА учитывай чувства и телесные ощущения, которые человек описал. "
+    "Один и тот же образ (например, «пустыня») может означать разное в зависимости от того, чувствовал ли человек покой или тревогу. "
+    "Связывай образ с чувством, а не интерпретируй образ отдельно.\n\n"
     "СТИЛЬ: Чистый русский язык. Понятный, приземлённый, структурный. Без маркдауна, без звёздочек и решёток."
 )
 
@@ -207,7 +211,7 @@ async def query_architect(original: str) -> str:
         if resp.status_code == 200:
             data = resp.json()
             content = data["choices"][0]["message"]["content"].strip()
-            content = clean_response(content)  # ← Очистка от маркдауна
+            content = clean_response(content)
             return content
         else:
             safe_log(f"Architect error: {resp.status_code}")
@@ -217,7 +221,7 @@ async def query_architect(original: str) -> str:
         return "🌫️ Духи на переправе..."
 
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/9.0"
+    server_version = "ShamanBot/11.0"
 
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -279,7 +283,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
             # /start
             elif text == "/start":
-                reply = "🌿 Приветствую, путник! 🌿\n\nЯ — проводник в мир духов. Расскажи о своём опыте саунд-хилинга или шаманского путешествия, и я помогу тебе увидеть его глубину и интегрировать полученные дары.\n\nВыбери, куда хочешь отправиться:"
+                reply = (
+                    "🌿 Приветствую, путник! 🌿\n\n"
+                    "Меня зовут Роман Атма, и я создал этого бота, чтобы помочь тебе глубже понять себя, раскрыть свои дары и таланты, увидеть скрытые смыслы в твоих переживаниях.\n\n"
+                    "Главный инструмент здесь — **Анализ опыта**. Ты описываешь то, что произошло с тобой во время саунд-хилинга или шаманского путешествия, а я даю тебе многомерную карту твоего опыта: от нейрофизиологии до архетипов.\n\n"
+                    "Это позволяет не просто «вспомнить», а по-настоящему интегрировать полученные дары и послания.\n\n"
+                    "Выбери, куда хочешь отправиться:"
+                )
                 keyboard = {
                     "keyboard": [
                         [{"text": "🔮 Анализ опыта"}, {"text": "🧘 Медитация"}],
@@ -298,10 +308,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
 
             elif text == "🔮 Анализ опыта":
-                send_message(chat_id, "🌿 Поведай мне о своём путешествии. Опиши образы, ощущения, эмоции — всё, что запомнилось. Я помогу тебе увидеть глубину этого опыта.")
+                instructions = (
+                    "🌿 Чтобы анализ был максимально глубоким и точным, опиши своё путешествие от начала и до конца.\n\n"
+                    "ОСОБЕННО ВАЖНО:\n"
+                    "— Какие чувства ты испытывал при появлении каждого образа? Страх, радость, любопытство, трепет?\n"
+                    "— Какие ощущения были в теле? Тепло, холод, вибрации, тяжесть, лёгкость?\n\n"
+                    "Помни: один и тот же образ может нести разный смысл в зависимости от того, что ты чувствуешь. "
+                    "Именно твои чувства — главный ключ к интерпретации.\n\n"
+                    "Расскажи всё, что запомнилось. Я слушаю."
+                )
+                send_message(chat_id, instructions)
 
             elif text == "🎨 Визуализировать образ":
                 send_message(chat_id, "🎨 Опиши образ, который хочешь увидеть. Я добавлю его в свой авторский стиль и создам картину.")
+                awaiting_image[chat_id] = True
 
             elif text == "📖 О проекте":
                 reply = "🌿 Мой путь, мои учителя, мои практики — всё это живёт в моём канале. Там же ты найдёшь статьи, уроки и истории, которые привели меня к этому дню.\n\nПереходи, там, в закреплённом сообщении, ты увидишь навигатор по всем важным темам. Добро пожаловать в мой мир.\n\n👉 https://t.me/RomanAtma_ThroatSinging"
@@ -328,14 +348,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
             # Обычный анализ
             else:
-                send_message(chat_id, "🌿 Шаман советуется с духами...")
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                response = loop.run_until_complete(query_vsegpt(chat_id, text))
-                loop.close()
-                send_message(chat_id, response)
-                last_user_experience[chat_id] = text
-                awaiting_architect[chat_id] = True
+                # Проверяем, ждёт ли бот промт для картинки
+                if awaiting_image.get(chat_id):
+                    awaiting_image[chat_id] = False
+                    send_message(chat_id, "🎨 Создаю образ...")
+                    try:
+                        image_path = generate_image(text)
+                        with open(image_path, "rb") as img:
+                            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+                            files = {"photo": img}
+                            data = {"chat_id": chat_id, "caption": f"✨ {text}"}
+                            requests.post(url, files=files, data=data)
+                        os.remove(image_path)
+                    except Exception as e:
+                        safe_log(f"Image error: {e}")
+                        send_message(chat_id, "🌫️ Не удалось создать образ.")
+                else:
+                    send_message(chat_id, "🌿 Шаман советуется с духами...")
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    response = loop.run_until_complete(query_vsegpt(chat_id, text))
+                    loop.close()
+                    send_message(chat_id, response)
+                    last_user_experience[chat_id] = text
+                    awaiting_architect[chat_id] = True
 
         self._send_json(200, {"ok": True})
 
