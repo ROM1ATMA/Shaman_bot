@@ -221,7 +221,7 @@ async def query_architect(original: str) -> str:
         return "🌫️ Духи на переправе..."
 
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/12.0"
+    server_version = "ShamanBot/13.0"
 
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -232,47 +232,48 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:
+        # Отдаём лендинг
+        if self.path == "/landing" or self.path == "/landing/":
+            try:
+                with open("landing/index.html", "r", encoding="utf-8") as f:
+                    html = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+                self.end_headers()
+                self.wfile.write(html.encode("utf-8"))
+                return
+            except FileNotFoundError:
+                self._send_json(404, {"error": "Landing page not found"})
+                return
+        
+        # Отдаём poster.jpg
+        if self.path == "/poster.jpg":
+            try:
+                with open("poster.jpg", "rb") as f:
+                    img = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(img)))
+                self.end_headers()
+                self.wfile.write(img)
+                return
+            except FileNotFoundError:
+                self._send_json(404, {"error": "Image not found"})
+                return
+        
+        # Health-check
         if self.path in ("/", "/health", "/ping"):
             self._send_json(200, {"status": "ok", "service": "shaman-bot"})
             return
+        
         self._send_json(404, {"ok": False, "error": "Not found"})
 
-    def do_GET(self) -> None:
-    # Отдаём лендинг
-    if self.path == "/landing" or self.path == "/landing/":
-        try:
-            with open("landing/index.html", "r", encoding="utf-8") as f:
-                html = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html.encode("utf-8"))))
-            self.end_headers()
-            self.wfile.write(html.encode("utf-8"))
+    def do_POST(self) -> None:
+        if self.path != "/webhook":
+            self._send_json(404, {"ok": False, "error": "Not found"})
             return
-        except FileNotFoundError:
-            self._send_json(404, {"error": "Landing page not found"})
-            return
-    
-    # Отдаём poster.jpg
-    if self.path == "/poster.jpg":
-        try:
-            with open("poster.jpg", "rb") as f:
-                img = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
-            self.send_header("Content-Length", str(len(img)))
-            self.end_headers()
-            self.wfile.write(img)
-            return
-        except FileNotFoundError:
-            self._send_json(404, {"error": "Image not found"})
-            return
-    
-    # Существующие маршруты
-    if self.path in ("/", "/health", "/ping"):
-        self._send_json(200, {"status": "ok", "service": "shaman-bot"})
-        return
-    self._send_json(404, {"ok": False, "error": "Not found"})
+
         if WEBHOOK_SECRET:
             incoming = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if incoming != WEBHOOK_SECRET:
