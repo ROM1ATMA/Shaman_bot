@@ -109,7 +109,7 @@ def send_message(chat_id: int, text: str) -> None:
     else:
         telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
 
-def telegram_api(method: str, payload: dict) -> tuple[bool, str]:
+def telegram_api(method: str, payload: dict) -> tuple:
     if not BOT_TOKEN:
         return False, "BOT_TOKEN is empty"
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -340,10 +340,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     "text": reply,
                     "reply_markup": json.dumps(keyboard)
                 })
+                self._send_json(200, {"ok": True})
+                return
 
             # Кнопки меню
             elif text == "🧘 Медитация":
                 telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
+                self._send_json(200, {"ok": True})
+                return
 
             elif text == "🔮 Анализ опыта":
                 instructions = (
@@ -356,14 +360,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     "Расскажи всё, что запомнилось. Я слушаю."
                 )
                 send_message(chat_id, instructions)
+                self._send_json(200, {"ok": True})
+                return
 
             elif text == "🎨 Визуализировать образ":
                 send_message(chat_id, "🎨 Опиши образ, который хочешь увидеть. Я добавлю его в свой авторский стиль и создам картину.")
                 awaiting_image[chat_id] = True
+                self._send_json(200, {"ok": True})
+                return
 
             elif text == "📖 О проекте":
                 reply = "🌿 Мой путь, мои учителя, мои практики — всё это живёт в моём канале. Там же ты найдёшь статьи, уроки и истории, которые привели меня к этому дню.\n\nПереходи, там, в закреплённом сообщении, ты увидишь навигатор по всем важным темам. Добро пожаловать в мой мир.\n\n👉 https://t.me/RomanAtma_ThroatSinging"
                 send_message(chat_id, reply)
+                self._send_json(200, {"ok": True})
+                return
 
             # /art
             elif text.startswith("/art"):
@@ -383,8 +393,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     except Exception as e:
                         safe_log(f"Image error: {e}")
                         send_message(chat_id, "🌫️ Не удалось создать образ.")
+                self._send_json(200, {"ok": True})
+                return
 
-            # Обычный анализ
+            # Обычное сообщение — анализ опыта
             else:
                 # Проверяем, ждёт ли бот промт для картинки
                 if awaiting_image.get(chat_id):
@@ -410,6 +422,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     send_message(chat_id, response)
                     last_user_experience[chat_id] = text
                     awaiting_architect[chat_id] = True
+                self._send_json(200, {"ok": True})
+                return
 
         self._send_json(200, {"ok": True})
 
