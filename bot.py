@@ -4,10 +4,20 @@ import sys
 import re
 import tempfile
 import asyncio
+import zipfile
 import requests
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib import error, request
+
+# --- Попытка импорта Vosk ---
+try:
+    from vosk import Model, KaldiRecognizer
+    import wave
+    VOSK_AVAILABLE = True
+except ImportError:
+    VOSK_AVAILABLE = False
+    print("⚠️ Vosk не установлен. Распознавание голоса будет недоступно.")
 
 # --- Конфигурация ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -18,6 +28,11 @@ PORT = int(os.getenv("PORT", "3000"))
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 CHANNEL_ID = -1002677656270
 MEDITATION_MESSAGE_ID = 222
+
+# --- Настройки Vosk ---
+VOSK_MODEL_PATH = "vosk-model-small-ru-0.22"
+VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
+SAMPLE_RATE = 16000
 
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN не найден!")
@@ -222,8 +237,116 @@ async def query_architect(original: str) -> str:
         safe_log(f"Architect exception: {e}")
         return "🌫️ Духи на переправе..."
 
+# --- Функции для работы с Vosk ---
+
+def download_and_extract_model():
+    """Скачивает и распаковывает модель Vosk, если её нет."""
+    if not VOSK_AVAILABLE:
+        safe_log("⚠️ Vosk не установлен, пропускаю загрузку модели")
+        return False
+    
+    if os.path.exists(VOSK_MODEL_PATH):
+        safe_log(f"✅ Модель Vosk уже существует: {VOSK_MODEL_PATH}")
+        return True
+    
+    safe_log(f"📥 Скачиваю модель Vosk из {VOSK_MODEL_URL}...")
+    zip_path = VOSK_MODEL_PATH + ".zip"
+    
+    try:
+        response = requests.get(VOSK_MODEL_URL, stream=True, timeout=300)
+        with open(zip_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        safe_log("📦 Распаковываю модель...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(".")
+        
+        os.remove(zip_path)
+        safe_log("✅ Модель Vosk готова к работе!")
+        return True
+    except Exception as e:
+        safe_log(f"❌ Ошибка загрузки модели Vosk: {e}")
+        return False
+
+def transcribe_voice(file_path: str) -> str:
+    """Распознаёт речь из аудиофайла через Vosk."""
+    if not VOSK_AVAILABLE:
+        return "[Ошибка: Vosk не установлен]"
+    
+    if not os.path.exists(VOSK_MODEL_PATH):
+        return "[Ошибка: модель Vosk не найдена]"
+    
+    try:
+        # Конвертируем ogg в wav через ffmpeg
+        wav_path = file_path + ".wav"
+        os.system(f"ffmpeg -i {file_path} -ar {SAMPLE_RATE} -ac 1 -f wav {wav_path} -y 2>/dev/null")
+        
+        if not os.path.exists(wav_path):
+            return "[Ошибка конвертации аудио]"
+        
+        model = Model(VOSK_MODEL_PATH)
+        wf = wave.open(wav_path, "rb")
+        
+        if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != SAMPLE_RATE:
+            safe_log(f"⚠️ Неподдерживаемый формат WAV: {wf.getparams()}")
+            wf.close()
+            os.remove(wav_path)
+            return "[Ошибка: неподдерживаемый формат аудио]"
+        
+        recognizer = KaldiRecognizer(model, SAMPLE_RATE)
+        recognizer.SetWords(True)
+        
+        result_text = ""
+        while True:
+            data = wf.readframes(4000)
+            if len(data) == 0:
+                break
+            if recognizer.AcceptWaveform(data):
+                part = json.loads(recognizer.Result())
+                result_text += part.get("text", "") + " "
+        
+        # Получаем финальный результат
+        final_part = json.loads(recognizer.FinalResult())
+        result_text += final_part.get("text", "")
+        
+        wf.close()
+        os.remove(wav_path)
+        
+        result = result_text.strip()
+        if not result:
+            return "[Не удалось распознать речь]"
+        
+        safe_log(f"🎤 Распознано: {result[:200]}...")
+        return result
+    
+    except Exception as e:
+        safe_log(f"❌ Ошибка распознавания: {e}")
+        return f"[Ошибка распознавания: {str(e)[:100]}]"
+
+def download_voice_file(file_id: str) -> str:
+    """Скачивает голосовое сообщение из Telegram."""
+    # Получаем информацию о файле
+    success, response = telegram_api("getFile", {"file_id": file_id})
+    if not success:
+        raise Exception(f"getFile failed: {response}")
+    
+    file_info = json.loads(response)
+    file_path = file_info["result"]["file_path"]
+    
+    # Скачиваем файл
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    resp = requests.get(url, timeout=30)
+    
+    if resp.status_code == 200:
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp.write(resp.content)
+            return tmp.name
+    
+    raise Exception(f"Download failed: {resp.status_code}")
+
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/13.0"
+    server_version = "ShamanBot/14.0"
 
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -266,7 +389,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
         
         # Health-check
         if self.path in ("/", "/health", "/ping"):
-            self._send_json(200, {"status": "ok", "service": "shaman-bot"})
+            vosk_status = "available" if (VOSK_AVAILABLE and os.path.exists(VOSK_MODEL_PATH)) else "unavailable"
+            self._send_json(200, {
+                "status": "ok",
+                "service": "shaman-bot",
+                "vosk_model": vosk_status
+            })
             return
         
         self._send_json(404, {"ok": False, "error": "Not found"})
@@ -297,6 +425,38 @@ class WebhookHandler(BaseHTTPRequestHandler):
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         text = message.get("text", "").strip()
+        voice = message.get("voice")
+
+        # Обработка голосового сообщения
+        if chat_id and voice:
+            safe_log(f"🎤 Голосовое сообщение от {chat_id}")
+            send_message(chat_id, "🎤 Распознаю твой голос...")
+            
+            try:
+                voice_file_id = voice.get("file_id")
+                voice_path = download_voice_file(voice_file_id)
+                recognized_text = transcribe_voice(voice_path)
+                os.remove(voice_path)
+                
+                # Отправляем распознанный текст пользователю
+                send_message(chat_id, f"📝 Я распознал:\n\n{recognized_text}")
+                
+                # Отправляем на анализ
+                send_message(chat_id, "🔮 Анализирую твой опыт...")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                response = loop.run_until_complete(query_vsegpt(chat_id, recognized_text))
+                loop.close()
+                send_message(chat_id, response)
+                last_user_experience[chat_id] = recognized_text
+                awaiting_architect[chat_id] = True
+                
+            except Exception as e:
+                safe_log(f"Voice error: {e}")
+                send_message(chat_id, "🌫️ Не удалось распознать голос. Попробуй написать текстом.")
+            
+            self._send_json(200, {"ok": True})
+            return
 
         if chat_id and text:
             safe_log(f"📩 Сообщение от {chat_id}: {text[:100]}...")
@@ -321,6 +481,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     "🌿 Добро пожаловать! 🌿\n\n"
                     "Я — проводник, созданный для того, чтобы помочь тебе глубже понять свой опыт, раскрыть внутренние дары и увидеть скрытые смыслы в твоих переживаниях.\n\n"
                     "Вот что ты можешь сделать здесь:\n\n"
+                    "🎤 **Голосовое сообщение** — ты можешь записать рассказ о своём путешествии голосом, и я распознаю его.\n\n"
                     "🔮 **Анализ опыта** — это главный инструмент. Расскажи о своём шаманском путешествии или саунд-хилинге, "
                     "и я помогу тебе увидеть, что происходило на уровне нейрофизиологии, какие архетипы проявились и как интегрировать этот опыт в жизнь. "
                     "Чем подробнее ты опишешь свои чувства и ощущения в теле — тем точнее будет карта.\n\n"
@@ -359,6 +520,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     "— Какие ощущения были в теле? Тепло, холод, вибрации, тяжесть, лёгкость?\n\n"
                     "Помни: один и тот же образ может нести разный смысл в зависимости от того, что ты чувствуешь. "
                     "Именно твои чувства — главный ключ к интерпретации.\n\n"
+                    "Ты можешь отправить текстом или записать голосовое сообщение — я распознаю.\n\n"
                     "Расскажи всё, что запомнилось. Я слушаю."
                 )
                 send_message(chat_id, instructions)
@@ -440,6 +602,14 @@ if __name__ == "__main__":
     safe_log(f"📍 Health check: http://{HOST}:{PORT}/health")
     safe_log(f"📍 Webhook: http://{HOST}:{PORT}/webhook")
     safe_log(f"📍 Landing: http://{HOST}:{PORT}/landing")
+    
+    # Загружаем модель Vosk при старте
+    safe_log("🔍 Проверяю модель Vosk...")
+    model_ready = download_and_extract_model()
+    if model_ready:
+        safe_log("✅ Vosk готов к распознаванию русской речи")
+    else:
+        safe_log("⚠️ Бот запущен без распознавания голоса")
     
     server = HTTPServer((HOST, PORT), WebhookHandler)
     try:
