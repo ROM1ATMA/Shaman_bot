@@ -19,6 +19,8 @@ VSEGPT_MODEL = "deepseek/deepseek-chat"
 CHANNEL_ID = -1002677656270
 MEDITATION_MESSAGE_ID = 222
 
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN не найден!")
 if not VSEGPT_API_KEY:
     print("❌ VSEGPT_API_KEY не найден!")
 else:
@@ -232,7 +234,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:
-        # Отдаём лендинг
+        # Лендинг
         if self.path == "/landing" or self.path == "/landing/":
             try:
                 with open("landing/index.html", "r", encoding="utf-8") as f:
@@ -247,7 +249,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "Landing page not found"})
                 return
         
-        # Отдаём poster.jpg
+        # Постер
         if self.path == "/poster.jpg":
             try:
                 with open("poster.jpg", "rb") as f:
@@ -398,7 +400,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
             # Обычное сообщение — анализ опыта
             else:
-                # Проверяем, ждёт ли бот промт для картинки
                 if awaiting_image.get(chat_id):
                     awaiting_image[chat_id] = False
                     send_message(chat_id, "🎨 Создаю образ...")
@@ -435,11 +436,15 @@ if __name__ == "__main__":
         safe_log("ERROR: BOT_TOKEN is empty")
         sys.exit(1)
 
-    safe_log(f"Starting Shaman Bot on {HOST}:{PORT}")
+    safe_log(f"🚀 Shaman Bot starting on {HOST}:{PORT}")
+    safe_log(f"📍 Health check: http://{HOST}:{PORT}/health")
+    safe_log(f"📍 Webhook: http://{HOST}:{PORT}/webhook")
+    safe_log(f"📍 Landing: http://{HOST}:{PORT}/landing")
+    
     server = HTTPServer((HOST, PORT), WebhookHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        safe_log("Shutting down...")
+        safe_log("⏹ Shutting down...")
     finally:
         server.server_close()
