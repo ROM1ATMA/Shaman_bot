@@ -326,7 +326,6 @@ def transcribe_voice(file_path: str) -> str:
 
 def download_voice_file(file_id: str) -> str:
     """Скачивает голосовое сообщение из Telegram."""
-    # Получаем информацию о файле
     success, response = telegram_api("getFile", {"file_id": file_id})
     if not success:
         raise Exception(f"getFile failed: {response}")
@@ -334,7 +333,6 @@ def download_voice_file(file_id: str) -> str:
     file_info = json.loads(response)
     file_path = file_info["result"]["file_path"]
     
-    # Скачиваем файл
     url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
     resp = requests.get(url, timeout=30)
     
@@ -344,6 +342,70 @@ def download_voice_file(file_id: str) -> str:
             return tmp.name
     
     raise Exception(f"Download failed: {resp.status_code}")
+
+# --- Функции для рассылки ---
+
+BROADCAST_FILE = "broadcast_media.json"
+USER_IDS_FILE = "user_ids.json"
+
+def save_user(chat_id: int) -> None:
+    """Сохраняет пользователя в файл."""
+    try:
+        if os.path.exists(USER_IDS_FILE):
+            with open(USER_IDS_FILE, "r") as f:
+                users = json.load(f)
+        else:
+            users = []
+        if chat_id not in users:
+            users.append(chat_id)
+            with open(USER_IDS_FILE, "w") as f:
+                json.dump(users, f)
+            safe_log(f"👤 Новый пользователь сохранён: {chat_id}")
+    except Exception as e:
+        safe_log(f"Ошибка сохранения пользователя: {e}")
+
+def save_broadcast_media(file_id: str, caption: str) -> None:
+    """Сохраняет file_id и подпись для рассылки."""
+    with open(BROADCAST_FILE, "w") as f:
+        json.dump({"file_id": file_id, "caption": caption}, f)
+    safe_log(f"📸 Медиа для рассылки сохранено: {file_id[:30]}...")
+
+def load_broadcast_media() -> tuple:
+    """Загружает file_id и подпись для рассылки."""
+    if not os.path.exists(BROADCAST_FILE):
+        return None, None
+    with open(BROADCAST_FILE, "r") as f:
+        data = json.load(f)
+    return data.get("file_id"), data.get("caption", "")
+
+def broadcast_to_all(file_id: str, caption: str) -> int:
+    """Рассылает фото с подписью всем пользователям."""
+    if not os.path.exists(USER_IDS_FILE):
+        safe_log("❌ Нет сохранённых пользователей")
+        return 0
+    
+    with open(USER_IDS_FILE, "r") as f:
+        users = json.load(f)
+    
+    count = 0
+    for user_id in users:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            data = {
+                "chat_id": user_id,
+                "photo": file_id,
+                "caption": caption
+            }
+            resp = requests.post(url, data=data, timeout=10)
+            if resp.status_code == 200:
+                count += 1
+            else:
+                safe_log(f"❌ Ошибка отправки пользователю {user_id}: {resp.status_code}")
+        except Exception as e:
+            safe_log(f"❌ Исключение для {user_id}: {e}")
+    
+    safe_log(f"📤 Рассылка завершена: {count}/{len(users)}")
+    return count
 
 class WebhookHandler(BaseHTTPRequestHandler):
     server_version = "ShamanBot/14.0"
@@ -426,10 +488,34 @@ class WebhookHandler(BaseHTTPRequestHandler):
         chat_id = chat.get("id")
         text = message.get("text", "").strip()
         voice = message.get("voice")
+        photo = message.get("photo")
 
-        # Обработка голосового сообщения
+        # --- Админ: сохраняем фото для рассылки ---
+        ADMIN_ID = 781629557
+        if chat_id == ADMIN_ID and photo:
+            file_id = photo[-1]["file_id"]
+            caption = message.get("caption", "")
+            save_broadcast_media(file_id, caption)
+            send_message(chat_id, "✅ Фото сохранено для рассылки. Теперь отправь /send_all чтобы разослать.")
+            self._send_json(200, {"ok": True})
+            return
+
+        # --- Админ: запуск рассылки ---
+        if chat_id == ADMIN_ID and text == "/send_all":
+            file_id, caption = load_broadcast_media()
+            if not file_id:
+                send_message(chat_id, "❌ Нет сохранённого фото. Сначала отправь фото с подписью.")
+            else:
+                send_message(chat_id, f"📤 Начинаю рассылку...")
+                count = broadcast_to_all(file_id, caption)
+                send_message(chat_id, f"✅ Рассылка завершена. Отправлено: {count} пользователям.")
+            self._send_json(200, {"ok": True})
+            return
+
+        # --- Обработка голосового сообщения ---
         if chat_id and voice:
             safe_log(f"🎤 Голосовое сообщение от {chat_id}")
+            save_user(chat_id)
             send_message(chat_id, "🎤 Распознаю твой голос...")
             
             try:
@@ -438,10 +524,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 recognized_text = transcribe_voice(voice_path)
                 os.remove(voice_path)
                 
-                # Отправляем распознанный текст пользователю
                 send_message(chat_id, f"📝 Я распознал:\n\n{recognized_text}")
-                
-                # Отправляем на анализ
                 send_message(chat_id, "🔮 Анализирую твой опыт...")
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -460,6 +543,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if chat_id and text:
             safe_log(f"📩 Сообщение от {chat_id}: {text[:100]}...")
+            save_user(chat_id)
 
             # Архитектурный уровень
             if awaiting_architect.get(chat_id) and text.lower() in ["да", "yes", "ага", "хочу", "lf"]:
@@ -603,7 +687,6 @@ if __name__ == "__main__":
     safe_log(f"📍 Webhook: http://{HOST}:{PORT}/webhook")
     safe_log(f"📍 Landing: http://{HOST}:{PORT}/landing")
     
-    # Загружаем модель Vosk при старте
     safe_log("🔍 Проверяю модель Vosk...")
     model_ready = download_and_extract_model()
     if model_ready:
