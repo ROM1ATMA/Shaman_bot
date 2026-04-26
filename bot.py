@@ -222,7 +222,7 @@ async def query_architect(original: str) -> str:
             "model": VSEGPT_MODEL,
             "messages": temp_history,
             "temperature": 0.7,
-            "max_tokens": 1500
+            "max_tokens": 3000
         }
         resp = requests.post(url, headers=headers, json=payload, timeout=60)
         if resp.status_code == 200:
