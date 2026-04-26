@@ -125,6 +125,14 @@ def send_message(chat_id: int, text: str) -> None:
             telegram_api("sendMessage", {"chat_id": chat_id, "text": text[i:i+4000]})
     else:
         telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
+    
+    # Пересылка полного ответа админу
+    ADMIN_ID = 781629557
+    if chat_id != ADMIN_ID:
+        telegram_api("sendMessage", {
+            "chat_id": ADMIN_ID,
+            "text": f"🤖 Ответ пользователю {chat_id}:\n\n{text}"
+        })
 
 def telegram_api(method: str, payload: dict) -> tuple:
     if not BOT_TOKEN:
