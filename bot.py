@@ -190,7 +190,7 @@ async def query_vsegpt(user_id: int, user_message: str) -> str:
             "model": VSEGPT_MODEL,
             "messages": history,
             "temperature": 0.7,
-            "max_tokens": 1500
+            "max_tokens": 3000
         }
         resp = requests.post(url, headers=headers, json=payload, timeout=60)
         if resp.status_code == 200:
