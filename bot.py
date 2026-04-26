@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib import error, request
 
-# --- Попытка импорта Vosk ---
 try:
     from vosk import Model, KaldiRecognizer
     import wave
@@ -19,7 +18,6 @@ except ImportError:
     VOSK_AVAILABLE = False
     print("⚠️ Vosk не установлен. Распознавание голоса будет недоступно.")
 
-# --- Конфигурация ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY") or os.getenv("VSEGPT_A_PI_KEY", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -29,7 +27,6 @@ VSEGPT_MODEL = "deepseek/deepseek-chat"
 CHANNEL_ID = -1002677656270
 MEDITATION_MESSAGE_ID = 222
 
-# --- Настройки Vosk ---
 VOSK_MODEL_PATH = "vosk-model-small-ru-0.22"
 VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
 SAMPLE_RATE = 16000
@@ -118,7 +115,6 @@ def safe_log(message: str) -> None:
     print(f"[{utc_now()}] {message}", flush=True)
 
 def clean_response(text: str) -> str:
-    """Очищает ответ от маркдауна."""
     if not text:
         return text
     text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
@@ -129,20 +125,11 @@ def clean_response(text: str) -> str:
     return text
 
 def send_message(chat_id: int, text: str) -> None:
-    """Отправляет сообщение, разбивая длинные на части."""
     if len(text) > 4000:
         for i in range(0, len(text), 4000):
             telegram_api("sendMessage", {"chat_id": chat_id, "text": text[i:i+4000]})
     else:
         telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
-    
-    # Пересылка полного ответа админу
-    ADMIN_ID = 781629557
-    if chat_id != ADMIN_ID:
-        telegram_api("sendMessage", {
-            "chat_id": ADMIN_ID,
-            "text": f"🤖 Ответ пользователю {chat_id}:\n\n{text}"
-        })
 
 def telegram_api(method: str, payload: dict) -> tuple:
     if not BOT_TOKEN:
@@ -225,7 +212,6 @@ async def query_vsegpt(user_id: int, user_message: str) -> str:
         return "🌫️ Духи на переправе..."
 
 async def query_architect(original: str) -> str:
-    """Запрос к архитектурному уровню через прямой HTTP."""
     try:
         url = "https://api.vsegpt.ru:6070/v1/chat/completions"
         headers = {
@@ -255,31 +241,23 @@ async def query_architect(original: str) -> str:
         safe_log(f"Architect exception: {e}")
         return "🌫️ Духи на переправе..."
 
-# --- Функции для работы с Vosk ---
-
 def download_and_extract_model():
-    """Скачивает и распаковывает модель Vosk, если её нет."""
     if not VOSK_AVAILABLE:
         safe_log("⚠️ Vosk не установлен, пропускаю загрузку модели")
         return False
-    
     if os.path.exists(VOSK_MODEL_PATH):
         safe_log(f"✅ Модель Vosk уже существует: {VOSK_MODEL_PATH}")
         return True
-    
     safe_log(f"📥 Скачиваю модель Vosk из {VOSK_MODEL_URL}...")
     zip_path = VOSK_MODEL_PATH + ".zip"
-    
     try:
         response = requests.get(VOSK_MODEL_URL, stream=True, timeout=300)
         with open(zip_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-        
         safe_log("📦 Распаковываю модель...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(".")
-        
         os.remove(zip_path)
         safe_log("✅ Модель Vosk готова к работе!")
         return True
@@ -288,32 +266,23 @@ def download_and_extract_model():
         return False
 
 def transcribe_voice(file_path: str) -> str:
-    """Распознаёт речь из аудиофайла через Vosk."""
     if not VOSK_AVAILABLE:
         return "[Ошибка: Vosk не установлен]"
-    
     if not os.path.exists(VOSK_MODEL_PATH):
         return "[Ошибка: модель Vosk не найдена]"
-    
     try:
         wav_path = file_path + ".wav"
         os.system(f"ffmpeg -i {file_path} -ar {SAMPLE_RATE} -ac 1 -f wav {wav_path} -y 2>/dev/null")
-        
         if not os.path.exists(wav_path):
             return "[Ошибка конвертации аудио]"
-        
         model = Model(VOSK_MODEL_PATH)
         wf = wave.open(wav_path, "rb")
-        
         if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != SAMPLE_RATE:
-            safe_log(f"⚠️ Неподдерживаемый формат WAV: {wf.getparams()}")
             wf.close()
             os.remove(wav_path)
             return "[Ошибка: неподдерживаемый формат аудио]"
-        
         recognizer = KaldiRecognizer(model, SAMPLE_RATE)
         recognizer.SetWords(True)
-        
         result_text = ""
         while True:
             data = wf.readframes(4000)
@@ -322,41 +291,31 @@ def transcribe_voice(file_path: str) -> str:
             if recognizer.AcceptWaveform(data):
                 part = json.loads(recognizer.Result())
                 result_text += part.get("text", "") + " "
-        
         final_part = json.loads(recognizer.FinalResult())
         result_text += final_part.get("text", "")
-        
         wf.close()
         os.remove(wav_path)
-        
         result = result_text.strip()
         if not result:
             return "[Не удалось распознать речь]"
-        
         safe_log(f"🎤 Распознано: {result[:200]}...")
         return result
-    
     except Exception as e:
         safe_log(f"❌ Ошибка распознавания: {e}")
         return f"[Ошибка распознавания: {str(e)[:100]}]"
 
 def download_voice_file(file_id: str) -> str:
-    """Скачивает голосовое сообщение из Telegram."""
     success, response = telegram_api("getFile", {"file_id": file_id})
     if not success:
         raise Exception(f"getFile failed: {response}")
-    
     file_info = json.loads(response)
     file_path = file_info["result"]["file_path"]
-    
     url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
     resp = requests.get(url, timeout=30)
-    
     if resp.status_code == 200:
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp.write(resp.content)
             return tmp.name
-    
     raise Exception(f"Download failed: {resp.status_code}")
 
 # --- Функции для рассылки ---
@@ -365,7 +324,6 @@ BROADCAST_FILE = "broadcast_media.json"
 USER_IDS_FILE = "user_ids.json"
 
 def save_user(chat_id: int) -> None:
-    """Сохраняет пользователя в файл."""
     try:
         if os.path.exists(USER_IDS_FILE):
             with open(USER_IDS_FILE, "r") as f:
@@ -381,13 +339,11 @@ def save_user(chat_id: int) -> None:
         safe_log(f"Ошибка сохранения пользователя: {e}")
 
 def save_broadcast_media(file_id: str, caption: str) -> None:
-    """Сохраняет file_id и подпись для рассылки."""
     with open(BROADCAST_FILE, "w") as f:
         json.dump({"file_id": file_id, "caption": caption}, f)
     safe_log(f"📸 Медиа для рассылки сохранено: {file_id[:30]}...")
 
 def load_broadcast_media() -> tuple:
-    """Загружает file_id и подпись для рассылки."""
     if not os.path.exists(BROADCAST_FILE):
         return None, None
     with open(BROADCAST_FILE, "r") as f:
@@ -395,23 +351,16 @@ def load_broadcast_media() -> tuple:
     return data.get("file_id"), data.get("caption", "")
 
 def broadcast_to_all(file_id: str, caption: str) -> int:
-    """Рассылает фото с подписью всем пользователям."""
     if not os.path.exists(USER_IDS_FILE):
         safe_log("❌ Нет сохранённых пользователей")
         return 0
-    
     with open(USER_IDS_FILE, "r") as f:
         users = json.load(f)
-    
     count = 0
     for user_id in users:
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-            data = {
-                "chat_id": user_id,
-                "photo": file_id,
-                "caption": caption
-            }
+            data = {"chat_id": user_id, "photo": file_id, "caption": caption}
             resp = requests.post(url, data=data, timeout=10)
             if resp.status_code == 200:
                 count += 1
@@ -419,12 +368,11 @@ def broadcast_to_all(file_id: str, caption: str) -> int:
                 safe_log(f"❌ Ошибка отправки пользователю {user_id}: {resp.status_code}")
         except Exception as e:
             safe_log(f"❌ Исключение для {user_id}: {e}")
-    
     safe_log(f"📤 Рассылка завершена: {count}/{len(users)}")
     return count
 
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/14.0"
+    server_version = "ShamanBot/15.0"
 
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -448,7 +396,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._send_json(404, {"error": "Landing page not found"})
                 return
-        
         if self.path == "/poster.jpg":
             try:
                 with open("poster.jpg", "rb") as f:
@@ -462,42 +409,31 @@ class WebhookHandler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._send_json(404, {"error": "Image not found"})
                 return
-        
         if self.path in ("/", "/health", "/ping"):
             vosk_status = "available" if (VOSK_AVAILABLE and os.path.exists(VOSK_MODEL_PATH)) else "unavailable"
-            self._send_json(200, {
-                "status": "ok",
-                "service": "shaman-bot",
-                "vosk_model": vosk_status
-            })
+            self._send_json(200, {"status": "ok", "service": "shaman-bot", "vosk_model": vosk_status})
             return
-        
         self._send_json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self) -> None:
         ADMIN_ID = 781629557
-
         if self.path != "/webhook":
             self._send_json(404, {"ok": False, "error": "Not found"})
             return
-
         if WEBHOOK_SECRET:
             incoming = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if incoming != WEBHOOK_SECRET:
                 safe_log("Rejected: invalid secret token")
                 self._send_json(403, {"ok": False, "error": "Invalid secret"})
                 return
-
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         decoded = raw.decode("utf-8", errors="replace")
-
         try:
             update = json.loads(decoded) if decoded else {}
         except json.JSONDecodeError:
             self._send_json(400, {"ok": False, "error": "Invalid JSON"})
             return
-
         message = update.get("message") or update.get("edited_message") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
@@ -505,16 +441,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
         voice = message.get("voice")
         photo = message.get("photo")
 
-        # --- Админ: сохраняем фото для рассылки ---
         if chat_id == ADMIN_ID and photo:
             file_id = photo[-1]["file_id"]
             caption = message.get("caption", "")
             save_broadcast_media(file_id, caption)
-            send_message(chat_id, "✅ Фото сохранено для рассылки. Теперь отправь /send_all чтобы разослать.")
+            send_message(chat_id, "✅ Фото сохранено. Отправь /send_all для рассылки.")
             self._send_json(200, {"ok": True})
             return
 
-        # --- Админ: запуск рассылки ---
         if chat_id == ADMIN_ID and text == "/send_all":
             file_id, caption = load_broadcast_media()
             if not file_id:
@@ -526,23 +460,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True})
             return
 
-        # --- Обработка голосового сообщения ---
         if chat_id and voice:
             safe_log(f"🎤 Голосовое сообщение от {chat_id}")
             save_user(chat_id)
-            
-            if chat_id != ADMIN_ID:
-                user_info = f"👤 От: {chat.get('first_name', '')} {chat.get('last_name', '')} (@{chat.get('username', 'нет')}) | ID: {chat_id}"
-                send_message(ADMIN_ID, f"🎤 Голосовое сообщение:\n{user_info}")
-            
             send_message(chat_id, "🎤 Распознаю твой голос...")
-            
             try:
                 voice_file_id = voice.get("file_id")
                 voice_path = download_voice_file(voice_file_id)
                 recognized_text = transcribe_voice(voice_path)
                 os.remove(voice_path)
-                
                 send_message(chat_id, f"📝 Я распознал:\n\n{recognized_text}")
                 send_message(chat_id, "🔮 Анализирую твой опыт...")
                 loop = asyncio.new_event_loop()
@@ -552,23 +478,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 send_message(chat_id, response)
                 last_user_experience[chat_id] = recognized_text
                 awaiting_architect[chat_id] = True
-                
             except Exception as e:
                 safe_log(f"Voice error: {e}")
                 send_message(chat_id, "🌫️ Не удалось распознать голос. Попробуй написать текстом.")
-            
             self._send_json(200, {"ok": True})
             return
 
         if chat_id and text:
             safe_log(f"📩 Сообщение от {chat_id}: {text[:100]}...")
             save_user(chat_id)
-            
-            if chat_id != ADMIN_ID:
-                user_info = f"👤 От: {chat.get('first_name', '')} {chat.get('last_name', '')} (@{chat.get('username', 'нет')}) | ID: {chat_id}"
-                send_message(ADMIN_ID, f"📩 Новое сообщение:\n{user_info}\n\n{text}")
 
-            # Архитектурный уровень
             if awaiting_architect.get(chat_id) and text.lower() in ["да", "yes", "ага", "хочу", "lf"]:
                 awaiting_architect[chat_id] = False
                 safe_log(f"Architect level triggered for {chat_id}")
@@ -582,7 +501,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True})
                 return
 
-            # /start
             elif text == "/start":
                 reply = (
                     "🌿 Добро пожаловать! 🌿\n\n"
@@ -613,7 +531,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True})
                 return
 
-            # Кнопки меню
             elif text == "🧘 Медитация":
                 telegram_api("forwardMessage", {"chat_id": chat_id, "from_chat_id": CHANNEL_ID, "message_id": MEDITATION_MESSAGE_ID})
                 self._send_json(200, {"ok": True})
@@ -641,12 +558,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 return
 
             elif text == "📖 О проекте":
-                reply = "🌿 Мой путь, мои учителя, мои практики — всё это живёт в моём канале. Там же ты найдёшь статьи, уроки и истории, которые привели меня к этому дню.\n\nПереходи, там, в закреплённом сообщении, ты увидишь навигатор по всем важным темам. Добро пожаловать в мой мир.\n\n👉 https://t.me/RomanAtma_ThroatSinging"
+                reply = (
+                    "🌿 Мой путь, мои учителя, мои практики — всё это живёт в моём канале. "
+                    "Там же ты найдёшь статьи, уроки и истории, которые привели меня к этому дню.\n\n"
+                    "Переходи, там, в закреплённом сообщении, ты увидишь навигатор по всем важным темам. "
+                    "Добро пожаловать в мой мир.\n\n👉 https://t.me/RomanAtma_ThroatSinging"
+                )
                 send_message(chat_id, reply)
                 self._send_json(200, {"ok": True})
                 return
 
-            # /art
             elif text.startswith("/art"):
                 prompt = text.replace("/art", "").strip()
                 if not prompt:
@@ -667,7 +588,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True})
                 return
 
-            # Обычное сообщение — анализ опыта
             else:
                 if awaiting_image.get(chat_id):
                     awaiting_image[chat_id] = False
@@ -704,19 +624,16 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         safe_log("ERROR: BOT_TOKEN is empty")
         sys.exit(1)
-
     safe_log(f"🚀 Shaman Bot starting on {HOST}:{PORT}")
     safe_log(f"📍 Health check: http://{HOST}:{PORT}/health")
     safe_log(f"📍 Webhook: http://{HOST}:{PORT}/webhook")
     safe_log(f"📍 Landing: http://{HOST}:{PORT}/landing")
-    
     safe_log("🔍 Проверяю модель Vosk...")
     model_ready = download_and_extract_model()
     if model_ready:
         safe_log("✅ Vosk готов к распознаванию русской речи")
     else:
         safe_log("⚠️ Бот запущен без распознавания голоса")
-    
     server = HTTPServer((HOST, PORT), WebhookHandler)
     try:
         server.serve_forever()
