@@ -278,7 +278,6 @@ def transcribe_voice(file_path: str) -> str:
         return "[Ошибка: модель Vosk не найдена]"
     
     try:
-        # Конвертируем ogg в wav через ffmpeg
         wav_path = file_path + ".wav"
         os.system(f"ffmpeg -i {file_path} -ar {SAMPLE_RATE} -ac 1 -f wav {wav_path} -y 2>/dev/null")
         
@@ -306,7 +305,6 @@ def transcribe_voice(file_path: str) -> str:
                 part = json.loads(recognizer.Result())
                 result_text += part.get("text", "") + " "
         
-        # Получаем финальный результат
         final_part = json.loads(recognizer.FinalResult())
         result_text += final_part.get("text", "")
         
@@ -419,7 +417,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:
-        # Лендинг
         if self.path == "/landing" or self.path == "/landing/":
             try:
                 with open("landing/index.html", "r", encoding="utf-8") as f:
@@ -434,7 +431,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "Landing page not found"})
                 return
         
-        # Постер
         if self.path == "/poster.jpg":
             try:
                 with open("poster.jpg", "rb") as f:
@@ -449,7 +445,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "Image not found"})
                 return
         
-        # Health-check
         if self.path in ("/", "/health", "/ping"):
             vosk_status = "available" if (VOSK_AVAILABLE and os.path.exists(VOSK_MODEL_PATH)) else "unavailable"
             self._send_json(200, {
@@ -462,6 +457,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self) -> None:
+        ADMIN_ID = 781629557
+
         if self.path != "/webhook":
             self._send_json(404, {"ok": False, "error": "Not found"})
             return
@@ -491,7 +488,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
         photo = message.get("photo")
 
         # --- Админ: сохраняем фото для рассылки ---
-        ADMIN_ID = 781629557
         if chat_id == ADMIN_ID and photo:
             file_id = photo[-1]["file_id"]
             caption = message.get("caption", "")
@@ -506,7 +502,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             if not file_id:
                 send_message(chat_id, "❌ Нет сохранённого фото. Сначала отправь фото с подписью.")
             else:
-                send_message(chat_id, f"📤 Начинаю рассылку...")
+                send_message(chat_id, "📤 Начинаю рассылку...")
                 count = broadcast_to_all(file_id, caption)
                 send_message(chat_id, f"✅ Рассылка завершена. Отправлено: {count} пользователям.")
             self._send_json(200, {"ok": True})
@@ -516,6 +512,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if chat_id and voice:
             safe_log(f"🎤 Голосовое сообщение от {chat_id}")
             save_user(chat_id)
+            
+            if chat_id != ADMIN_ID:
+                user_info = f"👤 От: {chat.get('first_name', '')} {chat.get('last_name', '')} (@{chat.get('username', 'нет')}) | ID: {chat_id}"
+                send_message(ADMIN_ID, f"🎤 Голосовое сообщение:\n{user_info}")
+            
             send_message(chat_id, "🎤 Распознаю твой голос...")
             
             try:
@@ -544,6 +545,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if chat_id and text:
             safe_log(f"📩 Сообщение от {chat_id}: {text[:100]}...")
             save_user(chat_id)
+            
+            if chat_id != ADMIN_ID:
+                user_info = f"👤 От: {chat.get('first_name', '')} {chat.get('last_name', '')} (@{chat.get('username', 'нет')}) | ID: {chat_id}"
+                send_message(ADMIN_ID, f"📩 Новое сообщение:\n{user_info}\n\n{text}")
 
             # Архитектурный уровень
             if awaiting_architect.get(chat_id) and text.lower() in ["да", "yes", "ага", "хочу", "lf"]:
