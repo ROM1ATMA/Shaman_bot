@@ -2,3 +2,6 @@ requests==2.32.3
 openai==0.28.1
 requests
 vosk
+fastapi
+httpx
+uvicorn
