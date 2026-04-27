@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
 
 # ================= APP =================
 
-app = FastAPI(title="ShamanBot FastAPI v8.1.13 (neuro-stalker lens)", lifespan=lifespan)
+app = FastAPI(title="ShamanBot FastAPI v8.1.15 (broadcast + self-inquiry)", lifespan=lifespan)
 
 if os.path.exists("landing"):
     app.mount("/landing", StaticFiles(directory="landing", html=True), name="landing")
@@ -63,6 +63,7 @@ if not WEBHOOK_SECRET:
     print("⚠️ WEBHOOK_SECRET not set — webhook is open")
 
 VSEGPT_MODEL = "deepseek/deepseek-chat"
+ADMIN_ID = 781629557
 USER_TTL = 3600
 MAX_QUEUE_SIZE = 100
 MAX_INPUT_LENGTH = 4000
@@ -78,6 +79,7 @@ media_http = httpx.AsyncClient(timeout=60, limits=http_limits)
 # ================= STATE =================
 
 STATE_IDLE = "idle"
+STATE_SELF_INQUIRY = "self_inquiry"
 STATE_EXPERIENCE_RECEIVED = "experience_received"
 STATE_IMAGE = "image"
 
@@ -85,6 +87,58 @@ users = {}
 queues = {}
 workers = {}
 locks = {}
+
+# ================= BROADCAST =================
+
+BROADCAST_FILE = "broadcast_media.json"
+USER_IDS_FILE = "user_ids.json"
+
+def save_user_to_file(chat_id: int) -> None:
+    try:
+        if os.path.exists(USER_IDS_FILE):
+            with open(USER_IDS_FILE, "r") as f:
+                u = json.load(f)
+        else:
+            u = []
+        if chat_id not in u:
+            u.append(chat_id)
+            with open(USER_IDS_FILE, "w") as f:
+                json.dump(u, f)
+    except Exception:
+        pass
+
+def save_broadcast_media(file_id: str, caption: str) -> None:
+    with open(BROADCAST_FILE, "w") as f:
+        json.dump({"file_id": file_id, "caption": caption}, f)
+
+def load_broadcast_media() -> tuple:
+    if not os.path.exists(BROADCAST_FILE):
+        return None, None
+    with open(BROADCAST_FILE, "r") as f:
+        data = json.load(f)
+    return data.get("file_id"), data.get("caption", "")
+
+async def broadcast_to_all(file_id: str, caption: str) -> int:
+    if not os.path.exists(USER_IDS_FILE):
+        return 0
+    with open(USER_IDS_FILE, "r") as f:
+        u = json.load(f)
+    count = 0
+    for uid in u:
+        try:
+            await asyncio.wait_for(
+                telegram_http.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                    data={"chat_id": uid, "photo": file_id, "caption": caption},
+                    timeout=10
+                ),
+                timeout=10
+            )
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    return count
 
 # ================= DEDUP =================
 
@@ -125,6 +179,7 @@ metrics = {
     "llm_calls": 0,
     "image_calls": 0,
     "voice_calls": 0,
+    "broadcasts": 0,
 }
 
 def record_action(action: str):
@@ -154,6 +209,24 @@ def get_transition_stats():
         {"from": f, "to": t, "count": c}
         for (f, t), c in transition_metrics.items()
     ]
+
+# ================= SELF-INQUIRY PROMPT =================
+
+SELF_INQUIRY_PROMPT = (
+    "Ты — внимательный проводник и коуч. Человек описал свой опыт. "
+    "Твоя задача — найти в его описании пробелы и задать ОДИН мягкий вопрос, "
+    "который запустит его собственное исследование.\n\n"
+    "Проверь три слоя:\n"
+    "1. Телесные ощущения: где в теле отзывался образ? Тепло? Холод? Вибрация? Сжатие? Расширение?\n"
+    "2. Чувства при встрече с образом: страх? радость? любопытство? трепет? Что-то ещё?\n"
+    "3. Личный смысл образа: что этот образ значит для самого человека? Какой заряд он несёт?\n\n"
+    "Если какой-то слой отсутствует или описан поверхностно — задай ОДИН мягкий вопрос именно про него. "
+    "Вопрос должен приглашать к исследованию, а не запрашивать данные. "
+    "Не спрашивай «опиши подробнее». Спрашивай: «Что ты чувствовал в теле, когда...», "
+    "«Какой смысл этот образ несёт для тебя лично?», «Какая эмоция поднялась, когда ты это увидел?»\n\n"
+    "Если все три слоя глубоко описаны — ответь одним словом: ПОЛНО.\n"
+    "Не анализируй. Не интерпретируй. Только вопрос или ПОЛНО."
+)
 
 # ================= NORMALISED KEYWORD DETECTION =================
 
@@ -373,6 +446,7 @@ def get_user(uid: int):
             "last_active": time.time()
         }
         log_event("user_created", uid=uid)
+        save_user_to_file(uid)
     users[uid]["last_active"] = time.time()
     return users[uid]
 
@@ -462,6 +536,13 @@ async def call_llm(messages, temp=0.7, max_tokens=2000):
             return "⚠️ Ошибка связи с моделью."
 
     return "⚠️ Модель недоступна."
+
+async def ask_self_inquiry(text: str) -> str:
+    """Задаёт коучинговый вопрос для самоисследования."""
+    return await call_llm([
+        {"role": "system", "content": SELF_INQUIRY_PROMPT},
+        {"role": "user", "content": text}
+    ], temp=0.5, max_tokens=150)
 
 async def apply_lens(lens_key: str, experience_text: str) -> tuple[str, str]:
     lens = LENS_LIBRARY[lens_key]
@@ -576,6 +657,7 @@ def transcribe_voice(file_path: str) -> str:
 def route(user: dict, text: str) -> str:
     state = user["state"]
 
+    # Системные команды
     if text == "/start" or text == "/new":
         return "new_experience"
     if text == "/menu":
@@ -583,25 +665,33 @@ def route(user: dict, text: str) -> str:
     if text == "/art":
         return "art"
 
-    # Ручной выбор линзы (по названию или по команде /neuro, /cbt и т.д.)
+    # Ручной выбор линзы
     lens_cmd = text.lstrip("/")
     if lens_cmd in LENS_LIBRARY:
         return f"lens_{lens_cmd}"
     if text in LENS_LIBRARY:
         return f"lens_{text}"
 
+    # Состояние IMAGE
     if state == STATE_IMAGE:
         return "image"
 
+    # Состояние SELF_INQUIRY — ответ на коучинговый вопрос
+    if state == STATE_SELF_INQUIRY:
+        return "self_inquiry_response"
+
+    # Состояние EXPERIENCE_RECEIVED
     if state == STATE_EXPERIENCE_RECEIVED:
         if is_new_experience(text):
             return "new_experience_silent"
         else:
             return "short_input_with_state"
 
+    # IDLE: новый опыт
     if is_new_experience(text):
-        return "experience_auto"
+        return "experience_with_inquiry"
 
+    # Короткое сообщение в IDLE
     return "short_input"
 
 
@@ -614,20 +704,49 @@ async def execute(uid: int, action: str, text: str) -> str:
         record_transition(last_action, action)
     user["last_action"] = action
 
+    # Явный новый опыт
     if action == "new_experience":
         user["state"] = STATE_IDLE
         user["last_experience"] = ""
         return (
-            "🌿 Я — многомерный проводник.\n\n"
+            "🌿 Я — многомерный проводник и коуч.\n\n"
             "Расскажи свой опыт (путешествие, сон, медитацию, видение), "
-            "и я посмотрю на него через разные линзы — шаманизм, нейрофизиологию, КПТ, Юнга, Таро, йогу, поле и другие.\n\n"
-            "Ты также можешь:\n"
-            "/art — создать образ по описанию\n"
-            "/menu — список всех линз\n"
-            "/new — начать заново\n\n"
-            "Расскажи, что ты пережил. Опиши образы, чувства, телесные ощущения."
+            "и я помогу тебе исследовать его глубже — через тело, чувства и личные смыслы.\n\n"
+            "А затем посмотрим через разные линзы: шаманизм, нейрофизиологию, КПТ, Юнга, Таро, йогу, поле и другие.\n\n"
+            "/art — создать образ | /menu — все линзы | /new — начать заново\n\n"
+            "Расскажи, что ты пережил."
         )
 
+    # Опыт с коучинговым inquiry
+    if action == "experience_with_inquiry":
+        if len(text) > MAX_INPUT_LENGTH:
+            text = text[:MAX_INPUT_LENGTH]
+
+        user["last_experience"] = text
+        log_event("experience_received", uid=uid, length=len(text))
+
+        inquiry = await ask_self_inquiry(text)
+
+        if "ПОЛНО" in inquiry.upper():
+            user["state"] = STATE_EXPERIENCE_RECEIVED
+            trace(uid, action, "exec_end", {"result": "experience_deep"})
+            return await _auto_lens_or_ask(uid, text, prefix="🌿 Сохранил твой опыт.")
+        else:
+            user["state"] = STATE_SELF_INQUIRY
+            log_event("self_inquiry_started", uid=uid)
+            trace(uid, action, "exec_end", {"result": "inquiry_question"})
+            return inquiry
+
+    # Ответ на коучинговый вопрос
+    if action == "self_inquiry_response":
+        full_text = user["last_experience"] + "\n\n" + text
+        user["last_experience"] = full_text
+        user["state"] = STATE_EXPERIENCE_RECEIVED
+        log_event("self_inquiry_completed", uid=uid)
+        trace(uid, action, "exec_end", {"result": "inquiry_response"})
+        return await _auto_lens_or_ask(uid, full_text, prefix="🌿 Спасибо. Теперь я вижу глубже.")
+
+    # Тихий новый опыт
     if action == "new_experience_silent":
         if len(text) > MAX_INPUT_LENGTH:
             text = text[:MAX_INPUT_LENGTH]
@@ -637,31 +756,33 @@ async def execute(uid: int, action: str, text: str) -> str:
         trace(uid, action, "exec_end", {"result": "experience_replaced"})
         return await _auto_lens_or_ask(uid, text, prefix="🌿 Сохранил как новый опыт.")
 
+    # Показ меню
     if action == "show_menu":
         return LENS_MENU_TEXT
 
+    # Короткое сообщение (IDLE)
     if action == "short_input":
         user["last_experience"] = text
-        user["state"] = STATE_EXPERIENCE_RECEIVED
+        user["state"] = STATE_SELF_INQUIRY
         log_event("short_experience_saved", uid=uid, length=len(text))
         trace(uid, action, "exec_end", {"result": "short_saved"})
-        return (
-            "🌿 Я сохранил это.\n\n"
-            "Что в этом было самым сильным — образ, чувство или телесное ощущение?\n"
-            "Или хочешь посмотреть на это через какую-то линзу?\n\n"
-            "/neuro — нейрофизиология | /cbt — КПТ | /jung — архетипы | /shaman — шаманизм\n"
-            "/tarot — Таро | /yoga — йога | /hindu — адвайта | /field — поле\n"
-            "/witness — наблюдатель | /stalker — нейро-сталкер"
-        )
 
+        inquiry = await ask_self_inquiry(text)
+        if "ПОЛНО" in inquiry.upper():
+            user["state"] = STATE_EXPERIENCE_RECEIVED
+            return await _auto_lens_or_ask(uid, text, prefix="🌿 Я сохранил это.")
+        return inquiry
+
+    # Короткое сообщение с сохранённым опытом
     if action == "short_input_with_state":
         trace(uid, action, "exec_end", {"result": "short_with_state"})
         return (
-            "Что в этом было самым сильным — образ, чувство или телесное ощущение?\n\n"
-            "Или хочешь посмотреть на сохранённый опыт через линзу?\n\n"
+            "У тебя уже есть сохранённый опыт.\n\n"
+            "Хочешь посмотреть на него через линзу?\n\n"
             "/neuro — нейрофизиология | /cbt — КПТ | /jung — архетипы | /shaman — шаманизм\n"
             "/tarot — Таро | /yoga — йога | /hindu — адвайта | /field — поле\n"
-            "/witness — наблюдатель | /stalker — нейро-сталкер"
+            "/witness — наблюдатель | /stalker — нейро-сталкер\n\n"
+            "Или расскажи новый опыт — и я сохраню его вместо предыдущего."
         )
 
     if action == "art":
@@ -694,6 +815,7 @@ async def execute(uid: int, action: str, text: str) -> str:
             user["state"] = STATE_EXPERIENCE_RECEIVED
             return "🌫️ Не удалось создать образ. Попробуй описать иначе."
 
+    # Ручная линза
     if action.startswith("lens_"):
         lens_key = action.replace("lens_", "")
         if not user.get("last_experience"):
@@ -706,36 +828,40 @@ async def execute(uid: int, action: str, text: str) -> str:
         record_action(f"lens_{lens_key}")
         trace(uid, action, "exec_end", {"lens": lens_key, "mode": "manual"})
 
-        return (
-            f"Смотрю через «{lens_name}».\n\n"
-            f"{result}\n\n"
-            f"Хочешь посмотреть под другим углом? Вот доступные:\n\n"
-            f"/neuro — нейрофизиология\n"
-            f"/cbt — когнитивная психология (КПТ)\n"
-            f"/jung — архетипы и символы (Юнг)\n"
-            f"/shaman — шаманизм\n"
-            f"/tarot — Таро\n"
-            f"/yoga — йога (энергетическая анатомия)\n"
-            f"/hindu — индуизм (адвайта)\n"
-            f"/field — поле (архитектор)\n"
-            f"/witness — наблюдатель\n"
-            f"/stalker — нейро-сталкер (указатель на Осознавание)\n\n"
-            f"Нажми на команду или напиши название линзы. Или расскажи новый опыт."
-        )
+        return _lens_response(lens_name, result)
 
+    # Опыт с авто-линзой (из self_inquiry)
     if action == "experience_auto":
         if len(text) > MAX_INPUT_LENGTH:
             text = text[:MAX_INPUT_LENGTH]
-
         user["last_experience"] = text
         user["state"] = STATE_EXPERIENCE_RECEIVED
         log_event("experience_received", uid=uid, length=len(text))
         trace(uid, action, "exec_end", {"result": "experience_saved"})
-
         return await _auto_lens_or_ask(uid, text, prefix="🌿 Сохранил твой опыт.")
 
     trace(uid, action, "exec_end", {"result": "unknown_action"})
     return "🌫️ Неизвестное действие. Напиши /menu."
+
+
+def _lens_response(lens_name: str, result: str) -> str:
+    """Формирует ответ после применения линзы с мостиком к следующему шагу."""
+    if "Сталкер" in lens_name:
+        next_step = "Заметил ли ты, КТО видит этот ответ прямо сейчас?"
+    elif "Поле" in lens_name:
+        next_step = "Хочешь увидеть, кто наблюдает эту решётку? /witness"
+    elif "Шаманизм" in lens_name:
+        next_step = "Хочешь, чтобы я показал архитектурный уровень этого опыта? /field"
+    elif "Наблюдатель" in lens_name:
+        next_step = "Хочешь посмотреть на этот опыт через другую линзу? /menu"
+    else:
+        next_step = "Хочешь посмотреть под другим углом? /menu покажет все линзы.\nИли, может, этот опыт что-то изменил в теле? Что ты чувствуешь сейчас?"
+
+    return (
+        f"Смотрю через «{lens_name}».\n\n"
+        f"{result}\n\n"
+        f"{next_step}"
+    )
 
 
 async def _auto_lens_or_ask(uid: int, text: str, prefix: str) -> str:
@@ -748,18 +874,8 @@ async def _auto_lens_or_ask(uid: int, text: str, prefix: str) -> str:
             f"{prefix}\n\n"
             f"Смотрю через «{lens_name}».\n\n"
             f"{result}\n\n"
-            f"Хочешь посмотреть под другим углом? Вот доступные:\n\n"
-            f"/neuro — нейрофизиология\n"
-            f"/cbt — когнитивная психология (КПТ)\n"
-            f"/jung — архетипы и символы (Юнг)\n"
-            f"/shaman — шаманизм\n"
-            f"/tarot — Таро\n"
-            f"/yoga — йога (энергетическая анатомия)\n"
-            f"/hindu — индуизм (адвайта)\n"
-            f"/field — поле (архитектор)\n"
-            f"/witness — наблюдатель\n"
-            f"/stalker — нейро-сталкер (указатель на Осознавание)\n\n"
-            f"Нажми на команду или напиши название линзы. Или расскажи новый опыт."
+            f"Хочешь посмотреть под другим углом? /menu покажет все линзы.\n"
+            f"Или, может, этот опыт что-то изменил в теле? Что ты чувствуешь сейчас?"
         )
 
     if lens_key == "weak":
@@ -894,6 +1010,28 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
 
     chat_id = msg["chat"]["id"]
 
+    # Админ: фото для рассылки
+    photo = msg.get("photo")
+    if chat_id == ADMIN_ID and photo:
+        file_id = photo[-1]["file_id"]
+        caption = msg.get("caption", "")
+        save_broadcast_media(file_id, caption)
+        asyncio.create_task(send(chat_id, "✅ Фото сохранено. Отправь /send_all для рассылки."))
+        return {"ok": True}
+
+    # Админ: запуск рассылки
+    text = msg.get("text", "")
+    if chat_id == ADMIN_ID and text == "/send_all":
+        file_id, caption = load_broadcast_media()
+        if not file_id:
+            asyncio.create_task(send(chat_id, "❌ Нет сохранённого фото. Сначала отправь фото с подписью."))
+        else:
+            metrics["broadcasts"] += 1
+            asyncio.create_task(send(chat_id, "📤 Начинаю рассылку..."))
+            count = await broadcast_to_all(file_id, caption)
+            asyncio.create_task(send(chat_id, f"✅ Рассылка завершена. Отправлено: {count} пользователям."))
+        return {"ok": True}
+
     # Голосовое сообщение
     voice = msg.get("voice")
     if voice:
@@ -903,7 +1041,6 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
         return {"ok": True}
 
     # Текстовое сообщение
-    text = msg.get("text", "")
     if text:
         enqueue(chat_id, text.strip())
 
