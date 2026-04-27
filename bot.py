@@ -109,9 +109,37 @@ def save_user_to_file(chat_id: int) -> None:
     except Exception:
         pass
 
-def save_broadcast_media(file_id: str, caption: str) -> None:
-    with open(BROADCAST_FILE, "w") as f:
-        json.dump({"file_id": file_id, "caption": caption}, f)
+async def broadcast_to_all(media: dict) -> int:
+    if not os.path.exists(USER_IDS_FILE):
+        return 0
+    with open(USER_IDS_FILE, "r") as f:
+        u = json.load(f)
+    
+    media_type = media.get("type", "photo")
+    file_id = media.get("file_id", "")
+    caption = media.get("caption", "")
+    
+    # Выбираем метод Telegram API
+    if media_type == "voice":
+        method = "sendVoice"
+        data = {"chat_id": None, "voice": file_id, "caption": caption}
+    else:
+        method = "sendPhoto"
+        data = {"chat_id": None, "photo": file_id, "caption": caption}
+    
+    count = 0
+    for uid in u:
+        try:
+            data["chat_id"] = uid
+            await asyncio.wait_for(
+                telegram_http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", data=data, timeout=10),
+                timeout=10
+            )
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    return count
 
 def load_broadcast_media() -> tuple:
     if not os.path.exists(BROADCAST_FILE):
