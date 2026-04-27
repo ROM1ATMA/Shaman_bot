@@ -5,12 +5,32 @@ import asyncio
 import re
 import httpx
 from collections import deque, defaultdict
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 
+# ================= LIFESPAN =================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # STARTUP
+    log_event("startup", port=int(os.getenv("PORT", "8080")))
+    cleanup_task = asyncio.create_task(cleanup_users())
+    yield
+    # SHUTDOWN
+    log_event("shutdown_start")
+    cleanup_task.cancel()
+    for uid, worker_task in list(workers.items()):
+        if not worker_task.done():
+            worker_task.cancel()
+    await telegram_http.aclose()
+    await llm_http.aclose()
+    await media_http.aclose()
+    log_event("shutdown_complete")
+
 # ================= APP =================
 
-app = FastAPI(title="ShamanBot FastAPI v8.1.2 (decision trace)")
+app = FastAPI(title="ShamanBot FastAPI v8.1.3 (lifecycle stable)", lifespan=lifespan)
 
 if os.path.exists("landing"):
     app.mount("/landing", StaticFiles(directory="landing", html=True), name="landing")
@@ -78,7 +98,6 @@ def log_event(event: str, uid: int = 0, **kwargs):
     trace_log.append(entry)
 
 def trace(uid: int, action: str, stage: str, meta: dict = None):
-    """Decision trace: captures causal chain of execution."""
     log_event("trace", uid=uid, action=action, stage=stage, meta=meta or {})
 
 # ================= METRICS =================
@@ -240,11 +259,6 @@ async def cleanup_users():
                 if worker and not worker.done():
                     worker.cancel()
         await asyncio.sleep(600)
-
-@app.on_event("startup")
-async def startup():
-    log_event("startup", port=int(os.getenv("PORT", "3000")))
-    asyncio.create_task(cleanup_users())
 
 # ================= TELEGRAM =================
 
@@ -569,10 +583,19 @@ def enqueue(uid: int, text: str):
         record_error("queue_full")
         return
 
+    log_event("worker_spawn_attempt", uid=uid)
+
     async def ensure_worker():
         async with locks[uid]:
+            # Проверяем, есть ли активный event loop
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                log_event("worker_spawn_failed_no_loop", uid=uid)
+                return
             if uid not in workers or workers[uid].done():
                 workers[uid] = asyncio.create_task(worker(uid))
+                log_event("worker_spawned", uid=uid)
 
     asyncio.create_task(ensure_worker())
 
@@ -626,15 +649,17 @@ async def health():
         "traces_by_stage": dict(traces_by_stage)
     }
 
-# ================= SHUTDOWN =================
+# ================= STARTUP =================
 
-@app.on_event("shutdown")
-async def shutdown():
-    log_event("shutdown_start")
-    for uid, worker_task in list(workers.items()):
-        if not worker_task.done():
-            worker_task.cancel()
-    await telegram_http.aclose()
-    await llm_http.aclose()
-    await media_http.aclose()
-    log_event("shutdown_complete")
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8080"))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        workers=1,
+        log_level="info"
+    )
