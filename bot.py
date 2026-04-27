@@ -1,9 +1,3 @@
-```python
-"""
-ShamanBot FastAPI v8.2.1 — Адаптивный Интегратор + Якорные вопросы (refined)
-Полный код со всеми изменениями.
-"""
-
 import os
 import json
 import time
