@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
 
 # ================= APP =================
 
-app = FastAPI(title="ShamanBot FastAPI v8.1.11 (voice input)", lifespan=lifespan)
+app = FastAPI(title="ShamanBot FastAPI v8.1.12 (clickable lens commands)", lifespan=lifespan)
 
 if os.path.exists("landing"):
     app.mount("/landing", StaticFiles(directory="landing", html=True), name="landing")
@@ -300,8 +300,8 @@ LENS_LIBRARY = {
 }
 
 LENS_SHORT_MENU = (
-    "Доступные линзы: neuro, cbt, jung, shaman, tarot, christian, hindu, kant, jyotish, field, witness. "
-    "Напиши название линзы — покажу через неё."
+    "Доступные линзы: /neuro, /cbt, /jung, /shaman, /tarot, /christian, /hindu, /kant, /jyotish, /field, /witness.\n"
+    "Нажми на команду или напиши название линзы."
 )
 
 # ================= USER =================
@@ -455,7 +455,6 @@ def check_ffmpeg() -> bool:
         return False
 
 async def download_voice_file(file_id: str) -> str:
-    """Скачивает голосовое сообщение из Telegram."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
     r = await telegram_http.post(url, json={"file_id": file_id})
     data = r.json()
@@ -471,7 +470,6 @@ async def download_voice_file(file_id: str) -> str:
     raise Exception(f"Download failed: {r.status_code}")
 
 def transcribe_voice(file_path: str) -> str:
-    """Распознаёт речь через Vosk."""
     import subprocess
     if not VOSK_AVAILABLE:
         return "[Ошибка: Vosk не установлен]"
@@ -527,6 +525,10 @@ def route(user: dict, text: str) -> str:
     if text == "/art":
         return "art"
 
+    # Ручной выбор линзы (по названию или по команде /neuro, /cbt и т.д.)
+    lens_cmd = text.lstrip("/")
+    if lens_cmd in LENS_LIBRARY:
+        return f"lens_{lens_cmd}"
     if text in LENS_LIBRARY:
         return f"lens_{text}"
 
@@ -557,7 +559,16 @@ async def execute(uid: int, action: str, text: str) -> str:
     if action == "new_experience":
         user["state"] = STATE_IDLE
         user["last_experience"] = ""
-        return "🌿 Расскажи, что ты пережил. Опиши образы, чувства, телесные ощущения."
+        return (
+            "🌿 Я — многомерный проводник.\n\n"
+            "Расскажи свой опыт (путешествие, сон, медитацию, видение), "
+            "и я посмотрю на него через разные линзы — шаманизм, нейрофизиологию, КПТ, Юнга, Таро, философию и другие.\n\n"
+            "Ты также можешь:\n"
+            "/art — создать образ по описанию\n"
+            "/menu — список всех линз\n"
+            "/new — начать заново\n\n"
+            "Расскажи, что ты пережил. Опиши образы, чувства, телесные ощущения."
+        )
 
     if action == "new_experience_silent":
         if len(text) > MAX_INPUT_LENGTH:
@@ -579,14 +590,20 @@ async def execute(uid: int, action: str, text: str) -> str:
         return (
             "🌿 Я сохранил это.\n\n"
             "Что в этом было самым сильным — образ, чувство или телесное ощущение?\n"
-            "Или хочешь посмотреть на это через какую-то линзу?"
+            "Или хочешь посмотреть на это через какую-то линзу?\n\n"
+            "/neuro — нейрофизиология | /cbt — КПТ | /jung — архетипы | /shaman — шаманизм\n"
+            "/tarot — Таро | /christian — христианство | /hindu — индуизм\n"
+            "/kant — Кант | /jyotish — джйотиш | /field — поле | /witness — наблюдатель"
         )
 
     if action == "short_input_with_state":
         trace(uid, action, "exec_end", {"result": "short_with_state"})
         return (
             "Что в этом было самым сильным — образ, чувство или телесное ощущение?\n\n"
-            "Или хочешь посмотреть на сохранённый опыт через какую-то линзу?"
+            "Или хочешь посмотреть на сохранённый опыт через линзу?\n\n"
+            "/neuro — нейрофизиология | /cbt — КПТ | /jung — архетипы | /shaman — шаманизм\n"
+            "/tarot — Таро | /christian — христианство | /hindu — индуизм\n"
+            "/kant — Кант | /jyotish — джйотиш | /field — поле | /witness — наблюдатель"
         )
 
     if action == "art":
@@ -606,7 +623,12 @@ async def execute(uid: int, action: str, text: str) -> str:
             user["last_experience"] = f"Образ: {text}"
             user["state"] = STATE_EXPERIENCE_RECEIVED
             trace(uid, action, "exec_end", {"latency": image_latency, "result": "photo_sent"})
-            return "✨ Образ создан и сохранён. Хочешь посмотреть на него через какую-то линзу?"
+            return (
+                "✨ Образ создан и сохранён. Хочешь посмотреть на него через линзу?\n\n"
+                "/neuro — нейрофизиология | /cbt — КПТ | /jung — архетипы | /shaman — шаманизм\n"
+                "/tarot — Таро | /christian — христианство | /hindu — индуизм\n"
+                "/kant — Кант | /jyotish — джйотиш | /field — поле | /witness — наблюдатель"
+            )
         except Exception as e:
             image_latency = round(time.time() - image_start, 3)
             record_latency("image_error", image_latency)
@@ -629,7 +651,19 @@ async def execute(uid: int, action: str, text: str) -> str:
         return (
             f"Смотрю через «{lens_name}».\n\n"
             f"{result}\n\n"
-            f"Хочешь посмотреть под другим углом — скажи каким."
+            f"Хочешь посмотреть под другим углом? Вот доступные:\n\n"
+            f"/neuro — нейрофизиология\n"
+            f"/cbt — когнитивная психология (КПТ)\n"
+            f"/jung — архетипы и символы (Юнг)\n"
+            f"/shaman — шаманизм\n"
+            f"/tarot — Таро\n"
+            f"/christian — христианство\n"
+            f"/hindu — индуизм (адвайта)\n"
+            f"/kant — философия Канта\n"
+            f"/jyotish — ведическая астрология\n"
+            f"/field — поле (архитектор)\n"
+            f"/witness — наблюдатель\n\n"
+            f"Нажми на команду или напиши название линзы. Или расскажи новый опыт."
         )
 
     if action == "experience_auto":
@@ -657,29 +691,47 @@ async def _auto_lens_or_ask(uid: int, text: str, prefix: str) -> str:
             f"{prefix}\n\n"
             f"Смотрю через «{lens_name}».\n\n"
             f"{result}\n\n"
-            f"Хочешь посмотреть под другим углом — скажи каким."
+            f"Хочешь посмотреть под другим углом? Вот доступные:\n\n"
+            f"/neuro — нейрофизиология\n"
+            f"/cbt — когнитивная психология (КПТ)\n"
+            f"/jung — архетипы и символы (Юнг)\n"
+            f"/shaman — шаманизм\n"
+            f"/tarot — Таро\n"
+            f"/christian — христианство\n"
+            f"/hindu — индуизм (адвайта)\n"
+            f"/kant — философия Канта\n"
+            f"/jyotish — ведическая астрология\n"
+            f"/field — поле (архитектор)\n"
+            f"/witness — наблюдатель\n\n"
+            f"Нажми на команду или напиши название линзы. Или расскажи новый опыт."
         )
 
     if lens_key == "weak":
         return (
             f"{prefix}\n\n"
             f"Я вижу несколько возможных углов. Что тебе ближе:\n"
-            f"— посмотреть через телесные ощущения и нейрофизиологию?\n"
-            f"— разобрать мысли и убеждения (КПТ)?\n"
-            f"— раскрыть архетипы и символы (Юнг)?\n"
-            f"— интерпретировать как шаманское путешествие?\n\n"
-            f"Или назови другую линзу."
+            f"— посмотреть через телесные ощущения и нейрофизиологию? (/neuro)\n"
+            f"— разобрать мысли и убеждения? (/cbt)\n"
+            f"— раскрыть архетипы и символы? (/jung)\n"
+            f"— интерпретировать как шаманское путешествие? (/shaman)\n\n"
+            f"Или выбери другую линзу — /menu"
         )
 
     return (
         f"{prefix}\n\n"
-        f"Через какую призму хочешь посмотреть?\n"
-        f"— neuro (нейрофизиология)\n"
-        f"— cbt (когнитивная психология)\n"
-        f"— jung (архетипы)\n"
-        f"— shaman (шаманизм)\n"
-        f"— tarot, christian, hindu, kant, jyotish, field, witness\n\n"
-        f"Напиши название линзы — и я покажу."
+        f"Через какую призму хочешь посмотреть?\n\n"
+        f"/neuro — нейрофизиология\n"
+        f"/cbt — когнитивная психология (КПТ)\n"
+        f"/jung — архетипы и символы (Юнг)\n"
+        f"/shaman — шаманизм\n"
+        f"/tarot — Таро\n"
+        f"/christian — христианство\n"
+        f"/hindu — индуизм (адвайта)\n"
+        f"/kant — философия Канта\n"
+        f"/jyotish — ведическая астрология\n"
+        f"/field — поле (архитектор)\n"
+        f"/witness — наблюдатель\n\n"
+        f"Нажми на команду или напиши название линзы."
     )
 
 
