@@ -1010,21 +1010,19 @@ async def execute(uid: int, action: str, text: str) -> str:
     user["last_action"] = action
 
     if action == "new_experience":
-        user.update({
-            "state": STATE_IDLE, "last_experience": "", "used_lenses": [],
-            "micro_states": [], "integration_count": 0,
-            "pending_anchor_lens": None, "last_integration_action": None,
-            "_fork_pending": False, "_architect_raw": None, "_architect_analysis": None,
-        })
-        return (
-            "🌿 Я — многомерный проводник и коуч.\n\n"
-            "Расскажи свой опыт (путешествие, сон, медитацию, видение), "
-            "и я помогу тебе исследовать его глубже — через тело, чувства и личные смыслы.\n\n"
-            "А затем посмотрим через разные линзы: шаманизм, нейрофизиологию, КПТ, Юнга, Таро, йогу, поле и другие.\n\n"
-            "/art — создать образ | /menu — все линзы | /new — начать заново | /integrate — собрать в целое\n"
-            "/architect — структурный разбор ситуации\n\n"
-            "Расскажи, что ты пережил."
-        )
+    user.update({
+        "state": STATE_IDLE, "last_experience": "", "used_lenses": [],
+        "micro_states": [], "integration_count": 0,
+        "pending_anchor_lens": None, "last_integration_action": None,
+        "_architect_raw": None, "_architect_analysis": None,
+    })
+    asyncio.create_task(send_menu_with_buttons(uid))
+    return (
+        "🌿 Я — многомерный проводник и коуч.\n\n"
+        "Расскажи свой опыт (путешествие, сон, медитацию, видение), "
+        "и я помогу тебе исследовать его глубже — через тело, чувства и личные смыслы.\n\n"
+        "👆 Выбери линзу на кнопках выше или расскажи, что ты пережил."
+    )
 
     if action == "reset_state":
         user.update({
