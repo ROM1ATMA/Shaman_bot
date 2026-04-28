@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
 
 # ================= APP =================
 
-app = FastAPI(title="ShamanBot FastAPI v8.2.1 (adaptive integrator refined)", lifespan=lifespan)
+app = FastAPI(title="ShamanBot FastAPI v8.2.2 (voice broadcast)", lifespan=lifespan)
 
 if os.path.exists("landing"):
     app.mount("/landing", StaticFiles(directory="landing", html=True), name="landing")
@@ -90,7 +90,7 @@ queues = {}
 workers = {}
 locks = {}
 
-# ================= BROADCAST =================
+# ================= BROADCAST (v8.2.2: voice support) =================
 
 BROADCAST_FILE = "broadcast_media.json"
 USER_IDS_FILE = "user_ids.json"
@@ -109,59 +109,39 @@ def save_user_to_file(chat_id: int) -> None:
     except Exception:
         pass
 
+def save_broadcast_media(media_type: str, file_id: str, caption: str = "") -> None:
+    with open(BROADCAST_FILE, "w") as f:
+        json.dump({"type": media_type, "file_id": file_id, "caption": caption}, f)
+
+def load_broadcast_media() -> dict:
+    if not os.path.exists(BROADCAST_FILE):
+        return {}
+    with open(BROADCAST_FILE, "r") as f:
+        return json.load(f)
+
 async def broadcast_to_all(media: dict) -> int:
     if not os.path.exists(USER_IDS_FILE):
         return 0
     with open(USER_IDS_FILE, "r") as f:
         u = json.load(f)
-    
+
     media_type = media.get("type", "photo")
     file_id = media.get("file_id", "")
     caption = media.get("caption", "")
-    
-    # Выбираем метод Telegram API
+
     if media_type == "voice":
         method = "sendVoice"
-        data = {"chat_id": None, "voice": file_id, "caption": caption}
+        data_template = {"chat_id": None, "voice": file_id, "caption": caption}
     else:
         method = "sendPhoto"
-        data = {"chat_id": None, "photo": file_id, "caption": caption}
-    
+        data_template = {"chat_id": None, "photo": file_id, "caption": caption}
+
     count = 0
     for uid in u:
         try:
-            data["chat_id"] = uid
+            payload = {**data_template, "chat_id": uid}
             await asyncio.wait_for(
-                telegram_http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", data=data, timeout=10),
-                timeout=10
-            )
-            count += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-    return count
-
-def load_broadcast_media() -> tuple:
-    if not os.path.exists(BROADCAST_FILE):
-        return None, None
-    with open(BROADCAST_FILE, "r") as f:
-        data = json.load(f)
-    return data.get("file_id"), data.get("caption", "")
-
-async def broadcast_to_all(file_id: str, caption: str) -> int:
-    if not os.path.exists(USER_IDS_FILE):
-        return 0
-    with open(USER_IDS_FILE, "r") as f:
-        u = json.load(f)
-    count = 0
-    for uid in u:
-        try:
-            await asyncio.wait_for(
-                telegram_http.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                    data={"chat_id": uid, "photo": file_id, "caption": caption},
-                    timeout=10
-                ),
+                telegram_http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", data=payload, timeout=10),
                 timeout=10
             )
             count += 1
@@ -533,7 +513,7 @@ def get_user(uid: int):
             "micro_states": [],
             "integration_count": 0,
             "pending_anchor_lens": None,
-            "last_integration_action": None,  # v8.2.1: защита от двойной интеграции
+            "last_integration_action": None,
         }
     users[uid]["last_active"] = time.time()
     return users[uid]
@@ -632,12 +612,9 @@ async def ask_self_inquiry(text: str) -> str:
     ], temp=0.5, max_tokens=150)
 
 async def apply_lens(lens_key: str, experience_text: str) -> tuple:
-    """v8.2.1: возвращает (lens_key, lens_name, result_text)"""
     lens = LENS_LIBRARY[lens_key]
-
     if lens.get("static_text"):
         return lens_key, lens["name"], lens["static_text"]
-
     prompt = lens["prompt"]
     result = await call_llm([
         {"role": "system", "content": prompt},
@@ -704,22 +681,18 @@ def transcribe_voice(file_path: str) -> str:
         return "[Ошибка: модель Vosk не найдена]"
     if not check_ffmpeg():
         return "[Ошибка: ffmpeg не установлен]"
-
     try:
         wav_path = file_path + ".wav"
         subprocess.run([
             "ffmpeg", "-i", file_path,
             "-ar", str(SAMPLE_RATE), "-ac", "1", wav_path, "-y"
         ], check=True, capture_output=True)
-
         if not os.path.exists(wav_path):
             return "[Ошибка конвертации]"
-
         model = Model(VOSK_MODEL_PATH)
         wf = wave.open(wav_path, "rb")
         recognizer = KaldiRecognizer(model, SAMPLE_RATE)
         recognizer.SetWords(True)
-
         result_text = ""
         while True:
             data = wf.readframes(4000)
@@ -728,12 +701,10 @@ def transcribe_voice(file_path: str) -> str:
             if recognizer.AcceptWaveform(data):
                 part = json.loads(recognizer.Result())
                 result_text += part.get("text", "") + " "
-
         final_part = json.loads(recognizer.FinalResult())
         result_text += final_part.get("text", "")
         wf.close()
         os.remove(wav_path)
-
         result = result_text.strip()
         return result if result else "[Не удалось распознать речь]"
     except Exception as e:
@@ -743,9 +714,7 @@ def transcribe_voice(file_path: str) -> str:
 # ================= ANCHOR CLASSIFIER =================
 
 def classify_anchor_response(answer: str) -> dict:
-    """Классифицирует ответ пользователя на якорный вопрос."""
     a = answer.lower()
-
     if any(w in a for w in ["осознал", "вдруг понял", "как будто", "озарение", "дошло", "вижу"]):
         depth = "insight"
     elif any(w in a for w in ["чувствую", "страх", "радость", "боль", "грусть",
@@ -783,8 +752,6 @@ def classify_anchor_response(answer: str) -> dict:
     }
 
 def should_trigger_integrator(user: dict) -> tuple:
-    """v8.2.1: возвращает (trigger: bool, reason: str)"""
-    # Защита от двойной интеграции
     last_action = user.get("last_action")
     last_integration = user.get("last_integration_action")
     if last_action == last_integration:
@@ -805,17 +772,14 @@ def should_trigger_integrator(user: dict) -> tuple:
 
     if last["depth"] == "insight" and last["relation"] == "integration":
         return True, "insight_integration"
-
     if last["relation"] == "overwhelm":
         return True, "overwhelm"
 
     insights = [m for m in micro if m["depth"] == "insight"]
     if len(insights) >= 2:
         return True, "double_insight"
-
     if len(used) >= 3:
         return True, "lens_count_force"
-
     if last["relation"] == "rejection":
         return False, "resistance"
 
@@ -858,7 +822,6 @@ FIRST_LINE_INTEGRATOR = {
 }
 
 async def run_integrator(user: dict) -> str:
-    """Запускает LLM для интеграции."""
     metrics["integrations"] = metrics.get("integrations", 0) + 1
     user["last_integration_action"] = user.get("last_action")
 
@@ -887,20 +850,17 @@ async def run_integrator(user: dict) -> str:
     first_line = FIRST_LINE_INTEGRATOR.get(dominant, "")
     return f"{first_line}\n\n{result}" if first_line else result
 
-# ================= LENS RESPONSE BUILDER (v8.2.1 — разделён) =================
+# ================= LENS RESPONSE BUILDER =================
 
 def build_lens_presentation(lens_key: str, lens_name: str, result: str) -> str:
-    """Собирает только текст ответа линзы, без управления состоянием."""
     return f"Смотрю через «{lens_name}».\n\n{result}"
 
 def build_anchor_question(lens_key: str) -> str | None:
-    """Возвращает якорный вопрос для линзы или None."""
     if lens_key in ANCHOR_QUESTIONS:
         return random.choice(ANCHOR_QUESTIONS[lens_key])
     return None
 
 def build_next_step(lens_key: str) -> str:
-    """Возвращает мостик к следующему шагу."""
     if "stalker" in lens_key:
         return "Заметил ли ты, КТО видит этот ответ прямо сейчас?"
     elif "field" in lens_key:
@@ -911,20 +871,16 @@ def build_next_step(lens_key: str) -> str:
         return ""
 
 def assemble_lens_response(lens_key: str, lens_name: str, result: str, user: dict) -> str:
-    """Собирает полный ответ линзы: презентация + якорь + следующий шаг. Управляет состоянием пользователя."""
     parts = [build_lens_presentation(lens_key, lens_name, result)]
-
     anchor = build_anchor_question(lens_key)
     if anchor:
         parts.append(f"\n\n{anchor}")
         user["pending_anchor_lens"] = lens_key
         user["state"] = STATE_ANCHOR_AWAIT
         metrics["anchor_questions"] = metrics.get("anchor_questions", 0) + 1
-
     next_step = build_next_step(lens_key)
     if next_step:
         parts.append(f"\n\n{next_step}")
-
     return "\n".join(parts)
 
 # ================= KERNEL: ROUTE + EXECUTE =================
@@ -977,16 +933,11 @@ async def execute(uid: int, action: str, text: str) -> str:
         record_transition(last_action, action)
     user["last_action"] = action
 
-    # new_experience
     if action == "new_experience":
         user.update({
-            "state": STATE_IDLE,
-            "last_experience": "",
-            "used_lenses": [],
-            "micro_states": [],
-            "integration_count": 0,
-            "pending_anchor_lens": None,
-            "last_integration_action": None,
+            "state": STATE_IDLE, "last_experience": "", "used_lenses": [],
+            "micro_states": [], "integration_count": 0,
+            "pending_anchor_lens": None, "last_integration_action": None,
         })
         return (
             "🌿 Я — многомерный проводник и коуч.\n\n"
@@ -997,19 +948,13 @@ async def execute(uid: int, action: str, text: str) -> str:
             "Расскажи, что ты пережил."
         )
 
-    # reset_state
     if action == "reset_state":
         user.update({
-            "used_lenses": [],
-            "micro_states": [],
-            "integration_count": 0,
-            "pending_anchor_lens": None,
-            "last_integration_action": None,
-            "state": STATE_IDLE,
+            "used_lenses": [], "micro_states": [], "integration_count": 0,
+            "pending_anchor_lens": None, "last_integration_action": None, "state": STATE_IDLE,
         })
         return "🔄 Состояние сброшено. Расскажи новый опыт."
 
-    # experience_with_inquiry
     if action == "experience_with_inquiry":
         if len(text) > MAX_INPUT_LENGTH:
             text = text[:MAX_INPUT_LENGTH]
@@ -1026,7 +971,6 @@ async def execute(uid: int, action: str, text: str) -> str:
             trace(uid, action, "exec_end", {"result": "inquiry_question"})
             return inquiry
 
-    # self_inquiry_response
     if action == "self_inquiry_response":
         full_text = user["last_experience"] + "\n\n" + text
         user["last_experience"] = full_text
@@ -1035,27 +979,20 @@ async def execute(uid: int, action: str, text: str) -> str:
         trace(uid, action, "exec_end", {"result": "inquiry_response"})
         return await _auto_lens_or_ask(uid, full_text, prefix="🌿 Спасибо. Теперь я вижу глубже.")
 
-    # new_experience_silent
     if action == "new_experience_silent":
         if len(text) > MAX_INPUT_LENGTH:
             text = text[:MAX_INPUT_LENGTH]
         user.update({
-            "last_experience": text,
-            "state": STATE_EXPERIENCE_RECEIVED,
-            "used_lenses": [],
-            "micro_states": [],
-            "integration_count": 0,
-            "last_integration_action": None,
+            "last_experience": text, "state": STATE_EXPERIENCE_RECEIVED,
+            "used_lenses": [], "micro_states": [], "integration_count": 0, "last_integration_action": None,
         })
         log_event("experience_replaced", uid=uid, length=len(text))
         trace(uid, action, "exec_end", {"result": "experience_replaced"})
         return await _auto_lens_or_ask(uid, text, prefix="🌿 Сохранил как новый опыт.")
 
-    # show_menu
     if action == "show_menu":
         return LENS_MENU_TEXT
 
-    # short_input
     if action == "short_input":
         user["last_experience"] = text
         user["state"] = STATE_SELF_INQUIRY
@@ -1067,7 +1004,6 @@ async def execute(uid: int, action: str, text: str) -> str:
             return await _auto_lens_or_ask(uid, text, prefix="🌿 Я сохранил это.")
         return inquiry
 
-    # short_input_with_state
     if action == "short_input_with_state":
         trace(uid, action, "exec_end", {"result": "short_with_state"})
         return (
@@ -1109,41 +1045,31 @@ async def execute(uid: int, action: str, text: str) -> str:
             user["state"] = STATE_EXPERIENCE_RECEIVED
             return "🌫️ Не удалось создать образ. Попробуй описать иначе."
 
-    # lens_*
     if action.startswith("lens_"):
         lens_key = action.replace("lens_", "")
         if not user.get("last_experience"):
             return "Сначала расскажи свой опыт, чтобы я мог применить линзу."
-
         lens_start = time.time()
         lens_key, lens_name, result = await apply_lens(lens_key, user["last_experience"])
         lens_latency = round(time.time() - lens_start, 3)
         record_latency(f"lens_{lens_key}", lens_latency)
         record_action(f"lens_{lens_key}")
         trace(uid, action, "exec_end", {"lens": lens_key, "mode": "manual"})
-
         if "used_lenses" not in user:
             user["used_lenses"] = []
         user["used_lenses"].append(lens_key)
-
-        # v8.2.1: разделённая сборка ответа
         return assemble_lens_response(lens_key, lens_name, result, user)
 
-    # anchor_response
     if action == "anchor_response":
         micro = classify_anchor_response(text)
         micro["lens"] = user.get("pending_anchor_lens", "unknown")
         user["pending_anchor_lens"] = None
-
         if "micro_states" not in user:
             user["micro_states"] = []
         user["micro_states"].append(micro)
-
         trigger, reason = should_trigger_integrator(user)
-        log_event("anchor_classified", uid=uid, depth=micro["depth"],
-                  relation=micro["relation"], trigger=reason)
+        log_event("anchor_classified", uid=uid, depth=micro["depth"], relation=micro["relation"], trigger=reason)
         trace(uid, action, "anchor_classified", {"trigger": reason, "depth": micro["depth"]})
-
         if trigger:
             user["state"] = STATE_EXPERIENCE_RECEIVED
             await asyncio.sleep(1)
@@ -1155,10 +1081,8 @@ async def execute(uid: int, action: str, text: str) -> str:
                 f"Хочешь посмотреть под другим углом? /menu покажет все линзы.\n"
                 f"Или расскажи, что изменилось в восприятии."
             )
-
         user["state"] = STATE_EXPERIENCE_RECEIVED
         trace(uid, action, "exec_end", {"integrated": False})
-
         if micro["relation"] == "rejection":
             return (
                 f"Похоже, этот взгляд не совсем попал. Давай попробуем иначе.\n\n"
@@ -1168,20 +1092,17 @@ async def execute(uid: int, action: str, text: str) -> str:
                 f"— раскрыть архетипы и символы? (/jung)\n"
                 f"— или выбери другую линзу — /menu"
             )
-
         return (
             f"Я запомнил это.\n\n"
             f"Хочешь посмотреть под другим углом? /menu покажет все линзы.\n"
             f"Или расскажи, что изменилось."
         )
 
-    # manual_integrate
     if action == "manual_integrate":
         if not user.get("last_experience"):
             return "Сначала расскажи свой опыт, чтобы я мог что-то собрать."
         if len(user.get("used_lenses", [])) < 1:
             return "Нужна хотя бы одна линза, чтобы было что собирать. Выбери: /menu"
-
         integration_text = await run_integrator(user)
         user["integration_count"] = user.get("integration_count", 0) + 1
         user["state"] = STATE_EXPERIENCE_RECEIVED
@@ -1191,7 +1112,6 @@ async def execute(uid: int, action: str, text: str) -> str:
             f"Хочешь посмотреть под другим углом? /menu покажет все линзы."
         )
 
-    # experience_auto (fallback)
     if action == "experience_auto":
         if len(text) > MAX_INPUT_LENGTH:
             text = text[:MAX_INPUT_LENGTH]
@@ -1207,21 +1127,14 @@ async def execute(uid: int, action: str, text: str) -> str:
 
 async def _auto_lens_or_ask(uid: int, text: str, prefix: str) -> str:
     lens_key = detect_lens(text)
-
     if lens_key and lens_key != "weak":
         lens_key, lens_name, result = await apply_lens(lens_key, text)
         record_action(f"auto_lens_{lens_key}")
-
         user = get_user(uid)
         if "used_lenses" not in user:
             user["used_lenses"] = []
         user["used_lenses"].append(lens_key)
-
-        return (
-            f"{prefix}\n\n"
-            f"{assemble_lens_response(lens_key, lens_name, result, user)}"
-        )
-
+        return f"{prefix}\n\n{assemble_lens_response(lens_key, lens_name, result, user)}"
     if lens_key == "weak":
         return (
             f"{prefix}\n\n"
@@ -1232,7 +1145,6 @@ async def _auto_lens_or_ask(uid: int, text: str, prefix: str) -> str:
             f"— интерпретировать как шаманское путешествие? (/shaman)\n\n"
             f"Или выбери другую линзу — /menu"
         )
-
     return (
         f"{prefix}\n\n"
         f"Через какую призму хочешь посмотреть?\n\n"
@@ -1259,28 +1171,21 @@ async def worker(uid: int):
             msg = await q.get()
             if msg is None:
                 break
-
             async with locks[uid]:
                 user = get_user(uid)
                 state = user["state"]
-
                 metrics["requests"] += 1
                 start = time.time()
                 log_event("request_start", uid=uid, state=state, msg=msg[:100])
-
                 action = route(user, msg)
                 record_action(action)
                 trace(uid, action, "route", {"state": state, "input": msg[:80]})
-
                 response = await execute(uid, action, msg)
-
                 if response:
                     await send(uid, response)
-
                 total_latency = round(time.time() - start, 3)
                 record_latency(action, total_latency)
                 log_event("request_done", uid=uid, state=state, action=action, latency=total_latency)
-
     except Exception as e:
         log_event("worker_crash", uid=uid, error=str(e)[:500], traceback=traceback.format_exc()[-500:])
     finally:
@@ -1292,13 +1197,10 @@ def enqueue(uid: int, text: str):
     if len(workers) > MAX_WORKERS and uid not in workers:
         log_event("too_many_workers", uid=uid)
         return
-
     if uid not in queues:
         queues[uid] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
         locks[uid] = asyncio.Lock()
-
     q = queues[uid]
-
     if q.full():
         try:
             q.get_nowait()
@@ -1306,16 +1208,13 @@ def enqueue(uid: int, text: str):
             record_error("queue_dropped")
         except asyncio.QueueEmpty:
             pass
-
     try:
         q.put_nowait(text)
     except asyncio.QueueFull:
         log_event("queue_full", uid=uid)
         record_error("queue_full")
         return
-
     log_event("worker_spawn_attempt", uid=uid)
-
     async def ensure_worker():
         async with locks[uid]:
             try:
@@ -1326,7 +1225,6 @@ def enqueue(uid: int, text: str):
             if uid not in workers or workers[uid].done():
                 workers[uid] = asyncio.create_task(worker(uid))
                 log_event("worker_spawned", uid=uid)
-
     asyncio.create_task(ensure_worker())
 
 # ================= WEBHOOK =================
@@ -1336,45 +1234,51 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         log_event("webhook_rejected", reason="bad_secret")
         raise HTTPException(403)
-
     try:
         data = await req.json()
     except Exception:
         log_event("bad_json")
         return {"ok": True}
-
     msg = data.get("message") or data.get("edited_message") or data.get("channel_post")
     if not msg:
         return {"ok": True}
-
     update_id = data.get("update_id")
     if update_id and dedup(update_id):
         return {"ok": True}
-
     chat_id = msg["chat"]["id"]
 
-    photo = msg.get("photo")
-    if chat_id == ADMIN_ID and photo:
-        file_id = photo[-1]["file_id"]
+    # Админ: сохраняем фото или голосовое для рассылки
+    if chat_id == ADMIN_ID:
+        photo = msg.get("photo")
+        voice = msg.get("voice")
         caption = msg.get("caption", "")
-        save_broadcast_media(file_id, caption)
-        asyncio.create_task(send(chat_id, "✅ Фото сохранено. Отправь /send_all для рассылки."))
-        return {"ok": True}
+        if photo:
+            file_id = photo[-1]["file_id"]
+            save_broadcast_media("photo", file_id, caption)
+            asyncio.create_task(send(chat_id, "✅ Фото сохранено. Отправь /send_all для рассылки."))
+            return {"ok": True}
+        if voice:
+            file_id = voice.get("file_id")
+            save_broadcast_media("voice", file_id, caption)
+            asyncio.create_task(send(chat_id, "✅ Голосовое сохранено. Отправь /send_all для рассылки."))
+            return {"ok": True}
 
     text = msg.get("text", "")
     if chat_id == ADMIN_ID and text == "/send_all":
-        file_id, caption = load_broadcast_media()
-        if not file_id:
-            asyncio.create_task(send(chat_id, "❌ Нет сохранённого фото. Сначала отправь фото с подписью."))
+        media = load_broadcast_media()
+        if not media:
+            asyncio.create_task(send(chat_id, "❌ Нет сохранённого медиа. Сначала отправь фото или голосовое с подписью."))
         else:
             metrics["broadcasts"] += 1
-            asyncio.create_task(send(chat_id, "📤 Начинаю рассылку..."))
-            count = await broadcast_to_all(file_id, caption)
+            media_type = media.get("type", "photo")
+            asyncio.create_task(send(chat_id, f"📤 Начинаю рассылку {'голосового' if media_type == 'voice' else 'фото'}..."))
+            count = await broadcast_to_all(media)
             asyncio.create_task(send(chat_id, f"✅ Рассылка завершена. Отправлено: {count} пользователям."))
         return {"ok": True}
 
+    # Голосовое от обычного пользователя — распознаём
     voice = msg.get("voice")
-    if voice:
+    if voice and chat_id != ADMIN_ID:
         log_event("voice_received", uid=chat_id)
         metrics["voice_calls"] += 1
         asyncio.create_task(_handle_voice(chat_id, voice))
@@ -1382,7 +1286,6 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
 
     if text:
         enqueue(chat_id, text.strip())
-
     return {"ok": True}
 
 
@@ -1393,7 +1296,6 @@ async def _handle_voice(chat_id: int, voice: dict):
         voice_path = await download_voice_file(file_id)
         recognized = transcribe_voice(voice_path)
         os.remove(voice_path)
-
         log_event("voice_transcribed", uid=chat_id, text=recognized[:200])
         await send(chat_id, f"📝 Я распознал:\n\n{recognized}")
         enqueue(chat_id, recognized)
@@ -1406,12 +1308,10 @@ async def _handle_voice(chat_id: int, voice: dict):
 @app.get("/health")
 async def health():
     queue_sizes = {str(uid): q.qsize() for uid, q in queues.items() if q.qsize() > 0}
-
     traces_by_stage = defaultdict(int)
     for entry in trace_log:
         if entry.get("event") == "trace":
             traces_by_stage[entry.get("stage", "unknown")] += 1
-
     return {
         "status": "ok",
         "users": len(users),
@@ -1432,13 +1332,5 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "8080"))
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        workers=1,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1, log_level="info")
