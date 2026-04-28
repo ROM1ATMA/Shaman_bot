@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
 
 # ================= APP =================
 
-app = FastAPI(title="ShamanBot FastAPI v8.2.2 (voice broadcast)", lifespan=lifespan)
+app = FastAPI(title="ShamanBot FastAPI v8.3.0 (architect module)", lifespan=lifespan)
 
 if os.path.exists("landing"):
     app.mount("/landing", StaticFiles(directory="landing", html=True), name="landing")
@@ -85,12 +85,19 @@ STATE_EXPERIENCE_RECEIVED = "experience_received"
 STATE_IMAGE = "image"
 STATE_ANCHOR_AWAIT = "anchor_await"
 
+# === АРХИТЕКТОР: новые состояния ===
+STATE_ARCHITECT_INQUIRY = "architect_inquiry"
+STATE_ARCHITECT_ANALYSIS = "architect_analysis"
+STATE_ARCHITECT_FORMULA = "architect_formula"
+STATE_ARCHITECT_STRATEGY = "architect_strategy"
+STATE_ARCHITECT_HUSH = "architect_hush"
+
 users = {}
 queues = {}
 workers = {}
 locks = {}
 
-# ================= BROADCAST (v8.2.2: voice support) =================
+# ================= BROADCAST =================
 
 BROADCAST_FILE = "broadcast_media.json"
 USER_IDS_FILE = "user_ids.json"
@@ -192,6 +199,7 @@ metrics = {
     "broadcasts": 0,
     "integrations": 0,
     "anchor_questions": 0,
+    "architect_sessions": 0,
 }
 
 def record_action(action: str):
@@ -386,6 +394,38 @@ LENS_LIBRARY = {
             "Пиши на чистом русском. Без маркдауна. Это не информация — это погружение."
         )
     },
+    "architect": {
+        "name": "Архитектор",
+        "prompt": (
+            "Ты — Архитектор сознания. Ты не интерпретируешь опыт. Ты выявляешь структуру.\n\n"
+            "ТВОЙ СТИЛЬ:\n"
+            "— Говори утверждениями, не вопросами (вопросы только когда запрашиваешь данные).\n"
+            "— Используй архитектурные метафоры: Ось, Горизонталь, Разлом, Геометрия, Сопряжение, "
+            "Интерференция, Канал, Фундамент, Деформация, Целостность.\n"
+            "— Не «ты чувствуешь», а «твоя система сигнализирует».\n"
+            "— Не «попробуй», а «конструкция предполагает».\n"
+            "— Не «мне кажется», а «архитектурная истина состоит в том, что».\n\n"
+            "ТВОЯ ЗАДАЧА:\n"
+            "Найти структурное несоответствие в ситуации пользователя и выстроить новую, "
+            "устойчивую архитектуру мышления и действия.\n\n"
+            "ЧЕТЫРЕ СЛОЯ АНАЛИЗА (выдай последовательно, но не нумеруй):\n\n"
+            "Слой A — Осевая Вертикаль пользователя:\n"
+            "Что уже стоит? Какая миссия, архетип, инструмент, форма? "
+            "Что является несущей конструкцией — что нельзя демонтировать?\n\n"
+            "Слой B — Векторная Горизонталь внешней системы:\n"
+            "Какова архитектура второй стороны? Её цель, метод, критерий истины?\n\n"
+            "Слой C — Несоответствие (Разлом):\n"
+            "Где две геометрии не сопрягаются? Где одна структура требует деформации другой? "
+            "Констатируй безоценочно: «Не потому, что кто-то плох. Потому что геометрии разные».\n\n"
+            "Слой D — Выпрямление и Мост:\n"
+            "Как сохранить Ось и остаться в контакте? Где возможно сопряжение, а где — граница? "
+            "Дай архитектурное решение.\n\n"
+            "ЗАВЕРШЕНИЕ:\n"
+            "Выдай Архитектурную Формулу — одну точную фразу: «Твоя Ось — ... Граница — ... Мост — ...»\n"
+            "И спроси: «Стоит эта конструкция?»\n\n"
+            "Пиши на чистом русском. Без маркдауна. Это не интерпретация — это чертёж."
+        )
+    },
     "witness": {
         "name": "Наблюдатель (свидетель)",
         "prompt": None,
@@ -449,7 +489,8 @@ LENS_MENU_TEXT = (
     "/tarot — Таро\n"
     "/yoga — йога (энергетическая анатомия)\n"
     "/hindu — индуизм (адвайта)\n"
-    "/field — поле (архитектор)\n"
+    "/field — поле (архитектор реальности)\n"
+    "/architect — Архитектор (структурный анализ ситуации)\n"
     "/witness — наблюдатель\n"
     "/stalker — нейро-сталкер (указатель на Осознавание)\n\n"
     "Нажми на команду или напиши название линзы."
@@ -514,6 +555,10 @@ def get_user(uid: int):
             "integration_count": 0,
             "pending_anchor_lens": None,
             "last_integration_action": None,
+            # Архитектор
+            "_fork_pending": False,
+            "_architect_raw": None,
+            "_architect_analysis": None,
         }
     users[uid]["last_active"] = time.time()
     return users[uid]
@@ -883,6 +928,27 @@ def assemble_lens_response(lens_key: str, lens_name: str, result: str, user: dic
         parts.append(f"\n\n{next_step}")
     return "\n".join(parts)
 
+# ================= ARCHITECT MODULE =================
+
+ARCHITECT_NULL_FORK_PROMPT = (
+    "Ты — проводник и коуч. Пользователь поделился опытом.\n"
+    "Твоя задача — задать ОДИН уточняющий вопрос, чтобы понять, по какому пути идти.\n\n"
+    "Спроси:\n"
+    "— Как он сам интерпретирует этот опыт?\n"
+    "— На какие сферы жизни это влияет (отношения, работа, деньги, здоровье, смыслы)?\n"
+    "— Что ему сейчас нужно: просто исследовать этот опыт или выстроить конкретную архитектуру действий?\n\n"
+    "Ответ должен заканчиваться на:\n"
+    "«Хочешь просто исследовать — или выстроить архитектуру?»\n\n"
+    "Говори на чистом русском, без маркдауна. Только вопрос."
+)
+
+async def assess_initial_intent(experience_text: str) -> str:
+    """Возвращает вопрос Нулевой Развилки."""
+    return await call_llm([
+        {"role": "system", "content": ARCHITECT_NULL_FORK_PROMPT},
+        {"role": "user", "content": f"Опыт: {experience_text}"}
+    ], temp=0.5, max_tokens=200)
+
 # ================= KERNEL: ROUTE + EXECUTE =================
 
 def route(user: dict, text: str) -> str:
@@ -912,6 +978,16 @@ def route(user: dict, text: str) -> str:
     if state == STATE_SELF_INQUIRY:
         return "self_inquiry_response"
 
+    # === АРХИТЕКТОР: новые состояния ===
+    if state == STATE_ARCHITECT_INQUIRY:
+        return "architect_inquiry_response"
+    if state == STATE_ARCHITECT_ANALYSIS:
+        return "architect_analysis_response"
+    if state == STATE_ARCHITECT_FORMULA:
+        return "architect_formula_response"
+    if state == STATE_ARCHITECT_STRATEGY:
+        return "architect_strategy_response"
+
     if state == STATE_EXPERIENCE_RECEIVED:
         if is_new_experience(text):
             return "new_experience_silent"
@@ -938,20 +1014,24 @@ async def execute(uid: int, action: str, text: str) -> str:
             "state": STATE_IDLE, "last_experience": "", "used_lenses": [],
             "micro_states": [], "integration_count": 0,
             "pending_anchor_lens": None, "last_integration_action": None,
+            "_fork_pending": False, "_architect_raw": None, "_architect_analysis": None,
         })
         return (
             "🌿 Я — многомерный проводник и коуч.\n\n"
             "Расскажи свой опыт (путешествие, сон, медитацию, видение), "
             "и я помогу тебе исследовать его глубже — через тело, чувства и личные смыслы.\n\n"
             "А затем посмотрим через разные линзы: шаманизм, нейрофизиологию, КПТ, Юнга, Таро, йогу, поле и другие.\n\n"
-            "/art — создать образ | /menu — все линзы | /new — начать заново | /integrate — собрать в целое\n\n"
+            "/art — создать образ | /menu — все линзы | /new — начать заново | /integrate — собрать в целое\n"
+            "/architect — структурный разбор ситуации\n\n"
             "Расскажи, что ты пережил."
         )
 
     if action == "reset_state":
         user.update({
             "used_lenses": [], "micro_states": [], "integration_count": 0,
-            "pending_anchor_lens": None, "last_integration_action": None, "state": STATE_IDLE,
+            "pending_anchor_lens": None, "last_integration_action": None,
+            "_fork_pending": False, "_architect_raw": None, "_architect_analysis": None,
+            "state": STATE_IDLE,
         })
         return "🔄 Состояние сброшено. Расскажи новый опыт."
 
@@ -963,8 +1043,11 @@ async def execute(uid: int, action: str, text: str) -> str:
         inquiry = await ask_self_inquiry(text)
         if "ПОЛНО" in inquiry.upper():
             user["state"] = STATE_EXPERIENCE_RECEIVED
-            trace(uid, action, "exec_end", {"result": "experience_deep"})
-            return await _auto_lens_or_ask(uid, text, prefix="🌿 Сохранил твой опыт.")
+            # === Нулевая Развилка ===
+            fork_question = await assess_initial_intent(text)
+            user["state"] = STATE_ARCHITECT_INQUIRY
+            user["_fork_pending"] = True
+            return fork_question
         else:
             user["state"] = STATE_SELF_INQUIRY
             log_event("self_inquiry_started", uid=uid)
@@ -976,8 +1059,11 @@ async def execute(uid: int, action: str, text: str) -> str:
         user["last_experience"] = full_text
         user["state"] = STATE_EXPERIENCE_RECEIVED
         log_event("self_inquiry_completed", uid=uid)
-        trace(uid, action, "exec_end", {"result": "inquiry_response"})
-        return await _auto_lens_or_ask(uid, full_text, prefix="🌿 Спасибо. Теперь я вижу глубже.")
+        # === Нулевая Развилка после добивки ===
+        fork_question = await assess_initial_intent(full_text)
+        user["state"] = STATE_ARCHITECT_INQUIRY
+        user["_fork_pending"] = True
+        return fork_question
 
     if action == "new_experience_silent":
         if len(text) > MAX_INPUT_LENGTH:
@@ -985,10 +1071,13 @@ async def execute(uid: int, action: str, text: str) -> str:
         user.update({
             "last_experience": text, "state": STATE_EXPERIENCE_RECEIVED,
             "used_lenses": [], "micro_states": [], "integration_count": 0, "last_integration_action": None,
+            "_fork_pending": False, "_architect_raw": None, "_architect_analysis": None,
         })
         log_event("experience_replaced", uid=uid, length=len(text))
-        trace(uid, action, "exec_end", {"result": "experience_replaced"})
-        return await _auto_lens_or_ask(uid, text, prefix="🌿 Сохранил как новый опыт.")
+        fork_question = await assess_initial_intent(text)
+        user["state"] = STATE_ARCHITECT_INQUIRY
+        user["_fork_pending"] = True
+        return fork_question
 
     if action == "show_menu":
         return LENS_MENU_TEXT
@@ -997,21 +1086,23 @@ async def execute(uid: int, action: str, text: str) -> str:
         user["last_experience"] = text
         user["state"] = STATE_SELF_INQUIRY
         log_event("short_experience_saved", uid=uid, length=len(text))
-        trace(uid, action, "exec_end", {"result": "short_saved"})
         inquiry = await ask_self_inquiry(text)
         if "ПОЛНО" in inquiry.upper():
             user["state"] = STATE_EXPERIENCE_RECEIVED
-            return await _auto_lens_or_ask(uid, text, prefix="🌿 Я сохранил это.")
+            fork_question = await assess_initial_intent(text)
+            user["state"] = STATE_ARCHITECT_INQUIRY
+            user["_fork_pending"] = True
+            return fork_question
+        user["state"] = STATE_SELF_INQUIRY
         return inquiry
 
     if action == "short_input_with_state":
-        trace(uid, action, "exec_end", {"result": "short_with_state"})
         return (
             "У тебя уже есть сохранённый опыт.\n\n"
             "Хочешь посмотреть на него через линзу?\n\n"
             "/neuro — нейрофизиология | /cbt — КПТ | /jung — архетипы | /shaman — шаманизм\n"
             "/tarot — Таро | /yoga — йога | /hindu — адвайта | /field — поле\n"
-            "/witness — наблюдатель | /stalker — нейро-сталкер\n\n"
+            "/architect — Архитектор | /witness — наблюдатель | /stalker — нейро-сталкер\n\n"
             "Или расскажи новый опыт — и я сохраню его вместо предыдущего.\n"
             "/integrate — собрать всё в целое"
         )
@@ -1032,11 +1123,11 @@ async def execute(uid: int, action: str, text: str) -> str:
             log_event("image_sent", uid=uid)
             user["last_experience"] = f"Образ: {text}"
             user["state"] = STATE_EXPERIENCE_RECEIVED
-            trace(uid, action, "exec_end", {"latency": image_latency, "result": "photo_sent"})
+            fork_question = await assess_initial_intent(user["last_experience"])
+            user["state"] = STATE_ARCHITECT_INQUIRY
+            user["_fork_pending"] = True
             return (
-                "✨ Образ создан и сохранён. Хочешь посмотреть на него через линзу?\n\n"
-                "/neuro | /cbt | /jung | /shaman | /tarot | /yoga | /hindu | /field | /witness | /stalker\n\n"
-                "/integrate — собрать всё в целое"
+                "✨ Образ создан и сохранён.\n\n" + fork_question
             )
         except Exception as e:
             image_latency = round(time.time() - image_start, 3)
@@ -1049,16 +1140,125 @@ async def execute(uid: int, action: str, text: str) -> str:
         lens_key = action.replace("lens_", "")
         if not user.get("last_experience"):
             return "Сначала расскажи свой опыт, чтобы я мог применить линзу."
+        # Если это architect — запускаем режим Архитектора вручную
+        if lens_key == "architect":
+            metrics["architect_sessions"] = metrics.get("architect_sessions", 0) + 1
+            user["state"] = STATE_ARCHITECT_ANALYSIS
+            return (
+                "🔧 Активирован модуль Архитектор.\n\n"
+                "Для структурного анализа мне нужно понять твою геометрию.\n\n"
+                "Ответь на три вопроса:\n"
+                "1. Что в этой ситуации является твоей Осью — тем, что не подлежит замене?\n"
+                "2. Как устроена вторая сторона? Её цель? Метод? Критерий истины?\n"
+                "3. Где проходит линия разлома — где ваши геометрии не сопрягаются?\n\n"
+                "Расскажи — и я выстрою чертёж."
+            )
         lens_start = time.time()
         lens_key, lens_name, result = await apply_lens(lens_key, user["last_experience"])
         lens_latency = round(time.time() - lens_start, 3)
         record_latency(f"lens_{lens_key}", lens_latency)
         record_action(f"lens_{lens_key}")
-        trace(uid, action, "exec_end", {"lens": lens_key, "mode": "manual"})
         if "used_lenses" not in user:
             user["used_lenses"] = []
         user["used_lenses"].append(lens_key)
         return assemble_lens_response(lens_key, lens_name, result, user)
+
+    # === АРХИТЕКТОР: Нулевая Развилка — ответ пользователя ===
+    if action == "architect_inquiry_response":
+        user["_fork_pending"] = False
+        response_lower = text.lower()
+        architect_keywords = ["архитект", "выстроить", "действ", "границ", "решени", "конфликт",
+                              "стратег", "алгоритм", "коммуникац", "отстоять", "разобраться как",
+                              "структур", "построить", "чертёж"]
+        explore_keywords = ["исследовать", "понять", "просто", "посмотреть", "изучить", "что это",
+                            "исследовани", "познать", "раскрыть"]
+
+        wants_architect = any(kw in response_lower for kw in architect_keywords)
+        wants_explore = any(kw in response_lower for kw in explore_keywords)
+
+        if wants_architect and not wants_explore:
+            metrics["architect_sessions"] = metrics.get("architect_sessions", 0) + 1
+            user["state"] = STATE_ARCHITECT_ANALYSIS
+            return (
+                "🔧 Активирован модуль Архитектор.\n\n"
+                "Начинаю структурный анализ.\n\n"
+                "Для этого мне нужно понять твою геометрию.\n\n"
+                "Ответь на три вопроса:\n"
+                "1. Что в этой ситуации является твоей Осью — тем, что не подлежит замене? "
+                "(Твоя миссия, твой архетип, твой инструмент, твоя форма — что уже стоит?)\n"
+                "2. Как устроена вторая сторона? Её цель? Её метод? Её критерий истины?\n"
+                "3. Где, по-твоему, проходит линия разлома — где ваши геометрии не сопрягаются?\n\n"
+                "Расскажи — и я выстрою чертёж."
+            )
+        else:
+            user["state"] = STATE_EXPERIENCE_RECEIVED
+            return await _auto_lens_or_ask(uid, text, prefix="🌿 Понял. Давай исследовать.")
+
+    # === АРХИТЕКТОР: ответ на вопросы Фазы 2 ===
+    if action == "architect_analysis_response":
+        full_arch_text = user["last_experience"] + "\n\n[Архитектурное самоисследование]:\n" + text
+        user["_architect_raw"] = full_arch_text
+
+        result = await call_llm([
+            {"role": "system", "content": LENS_LIBRARY["architect"]["prompt"]},
+            {"role": "user", "content": f"Ситуация:\n{full_arch_text}\n\nВыполни четырёхслойный анализ и выдай Архитектурную Формулу."}
+        ], temp=0.7, max_tokens=2500)
+
+        user["_architect_analysis"] = result
+        user["state"] = STATE_ARCHITECT_FORMULA
+        return result + "\n\nСтоит эта конструкция?"
+
+    # === АРХИТЕКТОР: ответ на Формулу (Фаза 4) ===
+    if action == "architect_formula_response":
+        response_lower = text.lower()
+        if any(w in response_lower for w in ["да", "стоит", "принимаю", "хорошо", "ок", "верно", "точно", "резонирует", "держится"]):
+            user["state"] = STATE_ARCHITECT_STRATEGY
+            strategy_prompt = (
+                "Конструкция принята.\n\n"
+                "Теперь — практический алгоритм.\n\n"
+                "На основе Архитектурной Формулы, которую ты вывел ранее, "
+                "предложи пользователю КОНКРЕТНЫЙ АЛГОРИТМ КОММУНИКАЦИИ из трёх шагов:\n\n"
+                "Шаг 1: Как признать общую цель и соединиться.\n"
+                "Шаг 2: Как предъявить свою Ось — не оправдываясь, а констатируя.\n"
+                "Шаг 3: Как предложить мост — интеграцию в свою геометрию.\n\n"
+                "Для каждого шага дай ТОЧНУЮ ФРАЗУ, которую можно сказать.\n"
+                "После алгоритма добавь:\n"
+                "«Это — каркас разговора. Когда будешь готов — я здесь для следующего чертежа».\n\n"
+                "Контекст:\n"
+                f"{user.get('_architect_raw', '')}\n\n"
+                f"Архитектурный анализ:\n{user.get('_architect_analysis', '')}"
+            )
+            strategy_text = await call_llm([
+                {"role": "system", "content": (
+                    "Ты — Архитектор. Ты уже провёл структурный анализ и выдал Формулу. "
+                    "Теперь ты даёшь практический алгоритм коммуникации. "
+                    "Говори структурно, утверждениями. Давай точные фразы для каждого шага. "
+                    "Без маркдауна. Чистый русский."
+                )},
+                {"role": "user", "content": strategy_prompt}
+            ], temp=0.7, max_tokens=2000)
+            return strategy_text
+        else:
+            user["state"] = STATE_ARCHITECT_ANALYSIS
+            return "Понял. Давай уточним. Что именно в конструкции не держится? Опиши, что нужно пересобрать."
+
+    # === АРХИТЕКТОР: ответ на стратегию (Фаза 5) ===
+    if action == "architect_strategy_response":
+        user["state"] = STATE_EXPERIENCE_RECEIVED
+        user["_architect_raw"] = None
+        user["_architect_analysis"] = None
+        hush_keywords = ["спокойств", "ясно", "понял", "принял", "сделаю", "попробую", "хорошо", "спасибо", "азарт"]
+        if any(kw in text.lower() for kw in hush_keywords):
+            return (
+                "Архитектура выстроена. Цикл завершён.\n\n"
+                "Тихо. Никто не прячется в ответах.\n\n"
+                "Когда будет нужен следующий чертёж — я здесь."
+            )
+        return (
+            "Цикл Архитектора завершён.\n\n"
+            "Хочешь посмотреть на ситуацию через другую линзу? /menu\n"
+            "Или расскажи новый опыт."
+        )
 
     if action == "anchor_response":
         micro = classify_anchor_response(text)
@@ -1069,20 +1269,17 @@ async def execute(uid: int, action: str, text: str) -> str:
         user["micro_states"].append(micro)
         trigger, reason = should_trigger_integrator(user)
         log_event("anchor_classified", uid=uid, depth=micro["depth"], relation=micro["relation"], trigger=reason)
-        trace(uid, action, "anchor_classified", {"trigger": reason, "depth": micro["depth"]})
         if trigger:
             user["state"] = STATE_EXPERIENCE_RECEIVED
             await asyncio.sleep(1)
             integration_text = await run_integrator(user)
             user["integration_count"] = user.get("integration_count", 0) + 1
-            trace(uid, action, "exec_end", {"integrated": True, "reason": reason})
             return (
                 f"{integration_text}\n\n"
                 f"Хочешь посмотреть под другим углом? /menu покажет все линзы.\n"
                 f"Или расскажи, что изменилось в восприятии."
             )
         user["state"] = STATE_EXPERIENCE_RECEIVED
-        trace(uid, action, "exec_end", {"integrated": False})
         if micro["relation"] == "rejection":
             return (
                 f"Похоже, этот взгляд не совсем попал. Давай попробуем иначе.\n\n"
@@ -1106,7 +1303,6 @@ async def execute(uid: int, action: str, text: str) -> str:
         integration_text = await run_integrator(user)
         user["integration_count"] = user.get("integration_count", 0) + 1
         user["state"] = STATE_EXPERIENCE_RECEIVED
-        trace(uid, action, "exec_end", {"manual_integration": True})
         return (
             f"{integration_text}\n\n"
             f"Хочешь посмотреть под другим углом? /menu покажет все линзы."
@@ -1118,10 +1314,11 @@ async def execute(uid: int, action: str, text: str) -> str:
         user["last_experience"] = text
         user["state"] = STATE_EXPERIENCE_RECEIVED
         log_event("experience_received", uid=uid, length=len(text))
-        trace(uid, action, "exec_end", {"result": "experience_saved"})
-        return await _auto_lens_or_ask(uid, text, prefix="🌿 Сохранил твой опыт.")
+        fork_question = await assess_initial_intent(text)
+        user["state"] = STATE_ARCHITECT_INQUIRY
+        user["_fork_pending"] = True
+        return fork_question
 
-    trace(uid, action, "exec_end", {"result": "unknown_action"})
     return "🌫️ Неизвестное действие. Напиши /menu."
 
 
@@ -1149,15 +1346,16 @@ async def _auto_lens_or_ask(uid: int, text: str, prefix: str) -> str:
         f"{prefix}\n\n"
         f"Через какую призму хочешь посмотреть?\n\n"
         f"/neuro — нейрофизиология\n"
-        f"/cbt — когнитивная психология (КПТ)\n"
-        f"/jung — архетипы и символы (Юнг)\n"
+        f"/cbt — КПТ\n"
+        f"/jung — архетипы\n"
         f"/shaman — шаманизм\n"
         f"/tarot — Таро\n"
-        f"/yoga — йога (энергетическая анатомия)\n"
-        f"/hindu — индуизм (адвайта)\n"
-        f"/field — поле (архитектор)\n"
+        f"/yoga — йога\n"
+        f"/hindu — адвайта\n"
+        f"/field — поле\n"
+        f"/architect — Архитектор (структурный разбор)\n"
         f"/witness — наблюдатель\n"
-        f"/stalker — нейро-сталкер (указатель на Осознавание)\n\n"
+        f"/stalker — нейро-сталкер\n\n"
         f"Нажми на команду или напиши название линзы."
     )
 
@@ -1247,7 +1445,6 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
         return {"ok": True}
     chat_id = msg["chat"]["id"]
 
-    # Админ: сохраняем фото или голосовое для рассылки
     if chat_id == ADMIN_ID:
         photo = msg.get("photo")
         voice = msg.get("voice")
@@ -1267,7 +1464,7 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
     if chat_id == ADMIN_ID and text == "/send_all":
         media = load_broadcast_media()
         if not media:
-            asyncio.create_task(send(chat_id, "❌ Нет сохранённого медиа. Сначала отправь фото или голосовое с подписью."))
+            asyncio.create_task(send(chat_id, "❌ Нет сохранённого медиа."))
         else:
             metrics["broadcasts"] += 1
             media_type = media.get("type", "photo")
@@ -1276,7 +1473,6 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
             asyncio.create_task(send(chat_id, f"✅ Рассылка завершена. Отправлено: {count} пользователям."))
         return {"ok": True}
 
-    # Голосовое от обычного пользователя — распознаём
     voice = msg.get("voice")
     if voice and chat_id != ADMIN_ID:
         log_event("voice_received", uid=chat_id)
