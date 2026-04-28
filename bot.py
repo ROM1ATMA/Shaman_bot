@@ -480,21 +480,26 @@ LENS_LIBRARY = {
     },
 }
 
-LENS_MENU_TEXT = (
-    "Доступные линзы:\n\n"
-    "/neuro — нейрофизиология\n"
-    "/cbt — когнитивная психология (КПТ)\n"
-    "/jung — архетипы и символы (Юнг)\n"
-    "/shaman — шаманизм\n"
-    "/tarot — Таро\n"
-    "/yoga — йога (энергетическая анатомия)\n"
-    "/hindu — индуизм (адвайта)\n"
-    "/field — поле (архитектор реальности)\n"
-    "/architect — Архитектор (структурный анализ ситуации)\n"
-    "/witness — наблюдатель\n"
-    "/stalker — нейро-сталкер (указатель на Осознавание)\n\n"
-    "Нажми на команду или напиши название линзы."
-)
+def build_menu_keyboard() -> dict:
+    """Строит InlineKeyboardMarkup для меню линз."""
+    buttons = [
+        [{"text": "🧠 Нейро", "callback_data": "neuro"}],
+        [{"text": "💭 КПТ", "callback_data": "cbt"}],
+        [{"text": "🏺 Юнг", "callback_data": "jung"}],
+        [{"text": "🦅 Шаман", "callback_data": "shaman"}],
+        [{"text": "🃏 Таро", "callback_data": "tarot"}],
+        [{"text": "🧘 Йога", "callback_data": "yoga"}],
+        [{"text": "🕉️ Адвайта", "callback_data": "hindu"}],
+        [{"text": "🌐 Поле", "callback_data": "field"}],
+        [{"text": "👁️ Наблюдатель", "callback_data": "witness"}],
+        [{"text": "🎯 Сталкер", "callback_data": "stalker"}],
+        [{"text": "🏛️ Архитектор", "callback_data": "architect"}],
+        [
+            {"text": "✨ Собрать в целое", "callback_data": "/integrate"},
+            {"text": "🔄 Новый опыт", "callback_data": "/new"},
+        ],
+    ]
+    return {"inline_keyboard": buttons}
 
 # ================= ANCHOR QUESTIONS =================
 
