@@ -131,6 +131,15 @@ def build_menu_keyboard() -> dict:
         [{"text": "🏛️ Архитектор", "callback_data": "architect"}],
         [{"text": "✨ Собрать в целое", "callback_data": "/integrate"}, {"text": "🔄 Новый опыт", "callback_data": "/new"}],
     ]}
+async def send_menu_with_buttons(chat_id: int) -> None:
+    await telegram_http.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": "🎯 Выбери линзу:",
+            "reply_markup": build_menu_keyboard()
+        }
+    )
 
 def build_emotion_keyboard() -> dict:
     return {"inline_keyboard": [
