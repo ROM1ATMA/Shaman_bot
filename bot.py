@@ -55,6 +55,34 @@ STATE_DEEP = "deep"
 STATE_IMAGE = "image"
 STATE_EXPERIENCE_RETURN = "experience_return"
 
+# 🔥 FIXED: Proper transitions
+TRANSITIONS = {
+    STATE_IDLE: {
+        "start": "start",
+        "input_experience": "input_experience",
+        "short_input": "short_input",
+        "show_menu": "show_menu",
+        "show_patterns": "show_patterns",
+        "reset_state": "reset_state",
+    },
+    STATE_REFLECTION: {"*": "focus"},  # Any input after reflection → focus
+    STATE_FOCUS: {"*": "emotion"},      # Any input after focus → emotion
+    STATE_EMOTION: {"*": "pattern"},    # Any input after emotion → pattern
+    STATE_PATTERN: {"*": "mirror_entry"}, # Any input after pattern → mirror
+    STATE_SELF_INQUIRY: {
+        "self_inquiry_response": "self_inquiry_response",
+        "self_inquiry_action": "self_inquiry_action",
+        "end": "end",
+    },
+    STATE_DEEP: {"*": "end"},
+    STATE_IMAGE: {"*": "image"},
+    STATE_EXPERIENCE_RETURN: {
+        "self_inquiry_response": "self_inquiry_response",
+        "self_inquiry_action": "self_inquiry_action",
+        "end": "end",
+    },
+}
+
 users = {}
 user_rate_limit = {}
 last_request_time = {}
@@ -264,10 +292,13 @@ def build_control_keyboard() -> dict:
         [{"text": "🤷 Не знаю", "callback_data": "control:не знаю"}],
     ]}
 
-# ================= ROUTING =================
+# ================= ROUTING (FIXED) =================
 def route(user: dict, text: str) -> str:
     state = user["state"]
+    
+    log(f"Route: state={state} text={text[:50]}")
 
+    # Commands that work in any state
     if text.startswith("self_inquiry:"): return "self_inquiry_action"
     if text.startswith("emotion:"): return "emotion"
     if text.startswith("control:"): return "pattern"
@@ -277,29 +308,44 @@ def route(user: dict, text: str) -> str:
     if text == "/reset": return "reset_state"
     if text == "/patterns": return "show_patterns"
 
+    # Lens commands
     lens_cmd = text[1:] if text.startswith("/") else None
     if lens_cmd and lens_cmd in LENS_LIBRARY:
         if user.get("last_experience"):
             return f"lens_{lens_cmd}"
         return "start"
 
-    if state == STATE_SELF_INQUIRY and text.lower() in ["всё", "хватит", "понял", "ясно"]:
-        return "self_inquiry_action"
-
-    if state == STATE_IDLE:
-        return "input_experience" if len(text.split()) >= 5 else "short_input"
+    # 🔥 FIXED: State-specific routing
+    if state == STATE_REFLECTION:
+        return "focus"  # Any text → focus
+    
+    if state == STATE_FOCUS:
+        return "emotion"  # Any text → emotion
+    
+    if state == STATE_EMOTION:
+        return "pattern"  # Any text → pattern
+    
+    if state == STATE_PATTERN:
+        return "mirror_entry"  # Any text → mirror
+    
     if state == STATE_SELF_INQUIRY:
+        if text.lower() in ["всё", "хватит", "понял", "ясно"]:
+            return "self_inquiry_action"
         return "self_inquiry_response"
+    
     if state == STATE_EXPERIENCE_RETURN:
         if text.startswith("/"):
             lc = text[1:]
             if lc in LENS_LIBRARY and user.get("last_experience"):
                 return f"lens_{lc}"
         return "self_inquiry_response"
-
-    v = user.get("user_vector", {})
-    if v.get("resistance", 0) >= 8 and state == STATE_EMOTION: return "focus"
-    if v.get("depth", 0) >= 8 and state == STATE_PATTERN: return "mirror_entry"
+    
+    if state == STATE_DEEP:
+        return "end"
+    
+    # Default: idle
+    if state == STATE_IDLE:
+        return "input_experience" if len(text.split()) >= 5 else "short_input"
 
     return "start"
 
@@ -530,12 +576,12 @@ def execute(uid: int, action: str, text: str) -> dict | None:
             {"role": "user", "content": text}
         ], max_tokens=300, user=user)
         return {"text": result}
+    
+    # 🔥 FIXED: These must happen in sequence
     if action == "focus": return handle_focus(user, text)
     if action == "emotion": return handle_emotion(user, text)
     if action == "pattern":
         response = handle_pattern(user, text)
-        user["state"] = STATE_EXPERIENCE_RETURN
-        save_users_sync()
         return response
     if action == "mirror_entry":
         user["state"] = STATE_SELF_INQUIRY
@@ -572,9 +618,19 @@ def process_message(chat_id: int, text: str) -> None:
     if response:
         send_message(chat_id, response.get("text", ""), response.get("keyboard"))
         
-        # After pattern/mirror: send experience return block
-        if action in ("pattern", "mirror_entry"):
-            time.sleep(0.5)
+        # After pattern: set state and send return block
+        if action in ("pattern",):
+            user["state"] = STATE_EXPERIENCE_RETURN
+            save_users_sync()
+            time.sleep(0.8)
+            return_block = add_experience_return_block()
+            send_message(chat_id, return_block["text"], return_block["keyboard"])
+        
+        # After mirror_entry: set state and send return block
+        if action == "mirror_entry":
+            user["state"] = STATE_EXPERIENCE_RETURN
+            save_users_sync()
+            time.sleep(0.8)
             return_block = add_experience_return_block()
             send_message(chat_id, return_block["text"], return_block["keyboard"])
 
@@ -618,7 +674,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "Not found"})
             return
         
-        # Secret check
         if WEBHOOK_SECRET:
             incoming = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if incoming != WEBHOOK_SECRET:
@@ -626,7 +681,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(403, {"ok": False, "error": "Invalid webhook secret"})
                 return
         
-        # Read body
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         body = raw.decode("utf-8", errors="replace")
@@ -677,7 +731,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 # ================= MAIN =================
 def set_webhook(public_url: str) -> int:
-    """Register webhook with Telegram"""
     payload = {"url": f"{public_url.rstrip('/')}/webhook"}
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
