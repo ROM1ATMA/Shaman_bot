@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     await media_http.aclose()
     log_event("shutdown_complete")
 
-app = FastAPI(title="ShamanBot v10.0-STABLE (freeze)", lifespan=lifespan)
+app = FastAPI(title="ShamanBot v10.0-STABLE (debug)", lifespan=lifespan)
 
 if os.path.exists("landing"):
     app.mount("/landing", StaticFiles(directory="landing", html=True), name="landing")
@@ -147,7 +147,6 @@ async def save_users():
     await asyncio.to_thread(_save_users_sync)
 
 async def safe_save():
-    """Simple locked save — no debounce magic"""
     async with save_lock:
         await save_users()
 
@@ -437,7 +436,7 @@ def trim_text(text: str, max_chars: int = 1500) -> str:
         return text
     return text[:max_chars].rsplit(".", 1)[0] + "."
 
-# ================= LOGGING / METRICS (frozen) =================
+# ================= LOGGING / METRICS =================
 def log_event(event: str, uid: int = 0, **kwargs):
     print(json.dumps({"ts": time.time(), "event": event, "uid": uid, **kwargs}, ensure_ascii=False))
 
@@ -497,7 +496,6 @@ async def cleanup_users():
         spawn(safe_save())
 
 async def cleanup_workers():
-    """Simplified worker cleanup"""
     while True:
         await asyncio.sleep(300)
         async with workers_lock:
@@ -769,7 +767,6 @@ async def add_experience_return_block() -> dict:
     }
 
 async def delayed_return_block(uid: int):
-    """Non-blocking return block with state check"""
     await asyncio.sleep(1.2)
     user = await get_user(uid)
     if user.get("state") != STATE_EXPERIENCE_RETURN:
@@ -965,7 +962,6 @@ async def handle_self_inquiry_response(user: dict, uid: int, text: str) -> dict:
             "keyboard": build_post_analysis_keyboard()
         }
     
-    # STABLE: rate-limited vector updates
     if (len(user_input) > 60 
         and time.time() - user.get("_last_vector_update", 0) > 120):
         await update_user_vector(user, user_input)
@@ -1127,7 +1123,6 @@ async def execute(uid: int, action: str, text: str) -> dict | None:
 
 # ================= WORKER =================
 async def worker(uid: int):
-    # STABLE: safe queue access
     q = queues.get(uid)
     if not q:
         log_event("worker_no_queue", uid=uid)
@@ -1141,6 +1136,7 @@ async def worker(uid: int):
                 user = await get_user(uid)
                 metrics["requests"] += 1
                 action = route(user, msg)
+                log_event("worker_action", uid=uid, action=action, msg=msg[:50])
                 response = await execute(uid, action, msg)
                 
                 if not response:
@@ -1163,19 +1159,21 @@ async def worker(uid: int):
         log_event("worker_stopped", uid=uid)
 
 async def enqueue(uid: int, text: str):
-    # STABLE: cooldown with feedback
+    log_event("enqueue_start", uid=uid, text=text[:50])
+    
     if not check_user_cooldown(uid):
+        log_event("cooldown_blocked", uid=uid)
         spawn(send(uid, "⏳ Подожди секунду"))
         return
     
-    # STABLE: rate limit with feedback
     if not check_rate_limit(uid):
-        spawn(send(uid, "⏳ Слишком часто, подожди немного"))
         log_event("rate_limited", uid=uid)
+        spawn(send(uid, "⏳ Слишком часто, подожди немного"))
         return
     
     async with workers_lock:
         if uid not in workers and len(workers) >= MAX_WORKERS:
+            log_event("max_workers_reached", uid=uid)
             return
         
         if uid not in queues:
@@ -1198,12 +1196,12 @@ async def enqueue(uid: int, text: str):
             log_event("queue_full", uid=uid)
             return
         
-        # STABLE: race-free worker creation
         async with workers_lock:
             if uid not in workers or workers[uid].done():
+                log_event("spawning_worker", uid=uid)
                 workers[uid] = spawn(worker(uid))
 
-# ================= WEBHOOK =================
+# ================= WEBHOOK (with debug logging) =================
 @app.post("/webhook")
 async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(None)):
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
@@ -1213,11 +1211,16 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
     except:
         return {"ok": True}
     
+    # DEBUG: log incoming data
+    log_event("webhook_received", data=str(data)[:300])
+    
     callback = data.get("callback_query")
     if callback:
         cid = callback.get("id")
         chat_id = callback["message"]["chat"]["id"]
         dtext = callback.get("data", "")
+        
+        log_event("callback_debug", uid=chat_id, data=dtext)
         
         if len(dtext) > MAX_CALLBACK_DATA:
             log_event("callback_too_long", size=len(dtext))
@@ -1232,13 +1235,29 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
         return {"ok": True}
     
     msg = data.get("message") or data.get("edited_message") or {}
-    if not msg: return {"ok": True}
+    if not msg:
+        log_event("webhook_no_message")
+        return {"ok": True}
     
     update_id = data.get("update_id")
-    if update_id and await dedup(update_id): return {"ok": True}
+    if update_id and await dedup(update_id):
+        log_event("dedup_blocked", update_id=update_id)
+        return {"ok": True}
     
     chat_id = msg["chat"]["id"]
     save_user_to_memory(chat_id)
+    
+    # FIX: extract text, handling bot_command entities
+    text = msg.get("text") or msg.get("caption") or ""
+    
+    # If entities contain bot_command but text is empty, try to get command
+    if not text and msg.get("entities"):
+        for entity in msg.get("entities", []):
+            if entity.get("type") == "bot_command":
+                text = msg.get("text", "")
+                break
+    
+    log_event("message_debug", uid=chat_id, text=text[:100], entities=bool(msg.get("entities")))
     
     if chat_id == ADMIN_ID:
         photo = msg.get("photo")
@@ -1254,8 +1273,6 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
             spawn(send(chat_id, "✅ Голосовое сохранено."))
             return {"ok": True}
     
-    text = msg.get("text", "")
-    
     if chat_id == ADMIN_ID and text == "/send_all":
         media = await load_broadcast_media()
         if not media:
@@ -1267,7 +1284,10 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
         return {"ok": True}
     
     if text:
+        log_event("webhook_enqueue", uid=chat_id, text=text[:50])
         await enqueue(chat_id, text.strip())
+    else:
+        log_event("webhook_no_text", uid=chat_id, msg_keys=list(msg.keys()))
     
     return {"ok": True}
 
