@@ -19,10 +19,8 @@ async def lifespan(app: FastAPI):
     load_users()
     log_event("startup", port=int(os.getenv("PORT", "8080")))
     
-    # Background maintenance tasks
     cleanup_task = spawn(cleanup_users())
     worker_cleanup_task = spawn(cleanup_workers())
-    monitor_task = spawn(monitor_background_tasks())
     user_ids_cleanup_task = spawn(cleanup_user_ids())
     rate_cleanup_task = spawn(cleanup_rate_limits())
     dedup_cleanup_task = spawn(cleanup_dedup())
@@ -32,12 +30,10 @@ async def lifespan(app: FastAPI):
     await force_save()
     log_event("shutdown_start")
     
-    # Cancel all maintenance tasks
-    for task in [cleanup_task, worker_cleanup_task, monitor_task, 
-                 user_ids_cleanup_task, rate_cleanup_task, dedup_cleanup_task]:
+    for task in [cleanup_task, worker_cleanup_task, user_ids_cleanup_task,
+                 rate_cleanup_task, dedup_cleanup_task]:
         task.cancel()
     
-    # Graceful worker shutdown with hard timeout
     if workers:
         for w in workers.values():
             if not w.done():
@@ -50,7 +46,6 @@ async def lifespan(app: FastAPI):
         except asyncio.TimeoutError:
             log_event("shutdown_worker_timeout")
     
-    # Background tasks cleanup
     if background_tasks:
         try:
             await asyncio.wait_for(
@@ -60,13 +55,12 @@ async def lifespan(app: FastAPI):
         except asyncio.TimeoutError:
             log_event("shutdown_tasks_timeout")
     
-    # Close HTTP clients
     await telegram_http.aclose()
     await llm_http.aclose()
     await media_http.aclose()
     log_event("shutdown_complete")
 
-app = FastAPI(title="ShamanBot v9.4.0 (production-ready)", lifespan=lifespan)
+app = FastAPI(title="ShamanBot v10.0-STABLE (freeze)", lifespan=lifespan)
 
 if os.path.exists("landing"):
     app.mount("/landing", StaticFiles(directory="landing", html=True), name="landing")
@@ -83,27 +77,33 @@ if not WEBHOOK_SECRET: print("⚠️ WEBHOOK_SECRET not set")
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 ADMIN_ID = 781629557
 USER_TTL = 3600
+USER_COOLDOWN = 1.5
 MAX_QUEUE_SIZE = 100
 MAX_INPUT_LENGTH = 4000
-MAX_WORKERS = 50  # Reduced from 100 to prevent resource exhaustion
+MAX_WORKERS = 50
 MAX_CALLBACK_DATA = 200
+MAX_SELF_INQUIRY_DEPTH = 5
 BROADCAST_SEMAPHORE = 10
+BROADCAST_BATCH_SIZE = 200
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "20"))
 TELEGRAM_CONCURRENCY = int(os.getenv("TELEGRAM_CONCURRENCY", "30"))
 RATE_LIMIT_WINDOW = 5
 RATE_LIMIT_MAX = 10
 
-# --- Global semaphores ---
+MIRROR_MAX_TOKENS = 900
+MIRROR_MAX_CHARS = 1500
+EXPERIENCE_SWEET_SPOT = 800
+
 llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 telegram_semaphore = asyncio.Semaphore(TELEGRAM_CONCURRENCY)
 
-# --- HTTP Clients with keep-alive (no double retry) ---
+# HTTP Clients
 limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 
 telegram_http = httpx.AsyncClient(
     timeout=httpx.Timeout(30.0, connect=10.0),
     limits=limits,
-    transport=httpx.AsyncHTTPTransport(retries=0)  # No transport-level retry
+    transport=httpx.AsyncHTTPTransport(retries=0)
 )
 llm_http = httpx.AsyncClient(
     timeout=httpx.Timeout(65.0, connect=10.0),
@@ -116,11 +116,8 @@ media_http = httpx.AsyncClient(
     transport=httpx.AsyncHTTPTransport(retries=0)
 )
 
-# ================= PERSISTENCE =================
+# ================= PERSISTENCE (simplified) =================
 save_lock = asyncio.Lock()
-_save_pending = False
-_save_flag_lock = asyncio.Lock()
-_save_debounce = 5.0
 
 def load_users():
     global users
@@ -150,27 +147,15 @@ async def save_users():
     await asyncio.to_thread(_save_users_sync)
 
 async def safe_save():
-    """Thread-safe debounced save"""
-    global _save_pending
-    async with _save_flag_lock:
-        if _save_pending:
-            return
-        _save_pending = True
-
-    try:
-        await asyncio.sleep(_save_debounce)
-        async with save_lock:
-            await save_users()
-    finally:
-        async with _save_flag_lock:
-            _save_pending = False
-
-async def force_save():
-    """Immediate save (shutdown)"""
+    """Simple locked save — no debounce magic"""
     async with save_lock:
         await save_users()
 
-# ================= STATE =================
+async def force_save():
+    async with save_lock:
+        await save_users()
+
+# ================= STATE MACHINE =================
 STATE_IDLE = "idle"
 STATE_REFLECTION = "reflection"
 STATE_FOCUS = "focus"
@@ -178,8 +163,8 @@ STATE_EMOTION = "emotion"
 STATE_PATTERN = "pattern"
 STATE_SELF_INQUIRY = "self_inquiry"
 STATE_DEEP = "deep"
-STATE_LENS = "lens"
 STATE_IMAGE = "image"
+STATE_EXPERIENCE_RETURN = "experience_return"
 STATE_ARCHITECT_ANALYSIS = "architect_analysis"
 STATE_ARCHITECT_FORMULA = "architect_formula"
 STATE_ARCHITECT_STRATEGY = "architect_strategy"
@@ -204,8 +189,12 @@ TRANSITIONS = {
         "end": "end",
     },
     STATE_DEEP: {"*": "end"},
-    STATE_LENS: {"*": "end"},
     STATE_IMAGE: {"*": "image"},
+    STATE_EXPERIENCE_RETURN: {
+        "self_inquiry_response": "self_inquiry_response",
+        "self_inquiry_action": "self_inquiry_action",
+        "end": "end",
+    },
     STATE_ARCHITECT_ANALYSIS: {"*": "architect_analysis_response"},
     STATE_ARCHITECT_FORMULA: {"*": "architect_formula_response"},
     STATE_ARCHITECT_STRATEGY: {"*": "architect_strategy_response"},
@@ -218,13 +207,10 @@ locks = {}
 users_lock = asyncio.Lock()
 workers_lock = asyncio.Lock()
 
-# Background tasks with error logging
 background_tasks = set()
 
 def spawn(coro):
-    """Spawn background task with error logging"""
     task = asyncio.create_task(coro)
-    
     def _done(t: asyncio.Task):
         background_tasks.discard(t)
         try:
@@ -233,19 +219,21 @@ def spawn(coro):
             pass
         except Exception as e:
             log_event("background_task_error", error=str(e)[:300])
-    
     background_tasks.add(task)
     task.add_done_callback(_done)
     return task
 
-async def monitor_background_tasks():
-    while True:
-        await asyncio.sleep(300)
-        if len(background_tasks) > 50:
-            log_event("background_tasks_warning", count=len(background_tasks))
-
-# ================= RATE LIMITING (with cleanup) =================
+# ================= RATE LIMITING + COOLDOWN =================
 user_rate_limit = {}
+last_request_time = {}
+
+def check_user_cooldown(uid: int) -> bool:
+    now = time.time()
+    last = last_request_time.get(uid, 0)
+    if now - last < USER_COOLDOWN:
+        return False
+    last_request_time[uid] = now
+    return True
 
 def check_rate_limit(uid: int) -> bool:
     now = time.time()
@@ -256,7 +244,6 @@ def check_rate_limit(uid: int) -> bool:
     return len(bucket) <= RATE_LIMIT_MAX
 
 async def cleanup_rate_limits():
-    """Prevent memory leak from abandoned rate limit buckets"""
     while True:
         await asyncio.sleep(600)
         now = time.time()
@@ -330,8 +317,16 @@ async def broadcast_to_all(media: dict) -> int:
         async with sem:
             return await _send_broadcast_one(uid, method, key, fid, cap)
 
-    results = await asyncio.gather(*[send_one(uid) for uid in list(user_ids_set)])
-    return sum(1 for r in results if r)
+    users_list = list(user_ids_set)
+    total_ok = 0
+    
+    for i in range(0, len(users_list), BROADCAST_BATCH_SIZE):
+        batch = users_list[i:i + BROADCAST_BATCH_SIZE]
+        results = await asyncio.gather(*[send_one(uid) for uid in batch])
+        total_ok += sum(results)
+        await asyncio.sleep(0.5)
+    
+    return total_ok
 
 # ================= INLINE KEYBOARDS =================
 def build_menu_keyboard() -> dict:
@@ -342,6 +337,13 @@ def build_menu_keyboard() -> dict:
         [{"text": "🕉️ Адвайта", "callback_data": "hindu"}, {"text": "🌐 Поле", "callback_data": "field"}],
         [{"text": "👁️ Наблюдатель", "callback_data": "witness"}, {"text": "🎯 Сталкер", "callback_data": "stalker"}],
         [{"text": "🏛️ Архитектор", "callback_data": "architect"}],
+    ]}
+
+def build_post_analysis_keyboard() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "🕳 Углубиться", "callback_data": "self_inquiry:deep"}],
+        [{"text": "🔍 Посмотреть через линзу", "callback_data": "self_inquiry:lens"}],
+        [{"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
 
 def build_emotion_keyboard() -> dict:
@@ -359,13 +361,6 @@ def build_control_keyboard() -> dict:
         [{"text": "🎮 Контроль", "callback_data": "control:контроль"}],
         [{"text": "🌊 Потеря контроля", "callback_data": "control:потеря"}],
         [{"text": "🤷 Не знаю", "callback_data": "control:не знаю"}],
-    ]}
-
-def build_self_inquiry_keyboard() -> dict:
-    return {"inline_keyboard": [
-        [{"text": "🕳 Углубиться", "callback_data": "self_inquiry:deep"}],
-        [{"text": "🔍 Другая линза", "callback_data": "self_inquiry:lens"}],
-        [{"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
 
 async def send_response(uid: int, response: dict) -> None:
@@ -405,13 +400,12 @@ async def answer_callback(callback_id: str) -> None:
     except:
         pass
 
-# ================= DEDUP WITH TTL (with cleanup) =================
+# ================= DEDUP =================
 processed_updates: dict[int, float] = {}
 dedup_lock = asyncio.Lock()
 DEDUP_TTL = 3600
 
 async def dedup(update_id: int) -> bool:
-    """Check and record update with TTL-based deduplication"""
     now = time.time()
     async with dedup_lock:
         if update_id in processed_updates:
@@ -420,7 +414,6 @@ async def dedup(update_id: int) -> bool:
         return False
 
 async def cleanup_dedup():
-    """Periodic cleanup to prevent memory leak"""
     while True:
         await asyncio.sleep(600)
         now = time.time()
@@ -429,80 +422,50 @@ async def cleanup_dedup():
             for k in expired:
                 processed_updates.pop(k, None)
 
-# ================= LOGGING / METRICS =================
-trace_log = deque(maxlen=2000)
+# ================= TEXT UTILITIES =================
+def ensure_complete_text(text: str) -> str:
+    if not text:
+        return text
+    if not text.strip().endswith((".", "!", "?", "»", "”", ")", "]", "}")):
+        last_dot = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+        if last_dot > 100:
+            return text[:last_dot + 1]
+    return text
 
+def trim_text(text: str, max_chars: int = 1500) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(".", 1)[0] + "."
+
+# ================= LOGGING / METRICS (frozen) =================
 def log_event(event: str, uid: int = 0, **kwargs):
     print(json.dumps({"ts": time.time(), "event": event, "uid": uid, **kwargs}, ensure_ascii=False))
 
 def trace(uid: int, action: str, stage: str, meta: dict = None):
     log_event("trace", uid=uid, action=action, stage=stage, meta=meta or {})
 
-action_metrics = defaultdict(int)
-error_metrics = defaultdict(int)
 metrics = {
     "requests": 0, "llm_calls": 0, "broadcasts": 0,
     "guide_sessions": 0, "interpretations": 0,
     "self_inquiries": 0, "vector_updates": 0
 }
 
-def record_action(action: str):
-    action_metrics[action] += 1
-
-def record_error(error_type: str):
-    error_metrics[error_type] += 1
-
-# ================= CIRCUIT BREAKER (fixed) =================
-class CircuitBreaker:
-    def __init__(self, failure_threshold=5, recovery_timeout=30):
-        self.failure_count = 0
-        self.last_failure = 0
-        self.threshold = failure_threshold
-        self.recovery = recovery_timeout
-        self.state = "closed"
-        self._lock = asyncio.Lock()
-    
-    async def call(self, coro):
-        async with self._lock:
-            if self.state == "open":
-                if time.time() - self.last_failure > self.recovery:
-                    self.state = "half-open"
-                    log_event("circuit_breaker_half_open")
-                else:
-                    raise CircuitBreakerOpen("Circuit breaker is open")
-        
-        try:
-            result = await coro
-            async with self._lock:
-                self.failure_count = 0  # ✅ Reset on success
-                if self.state == "half-open":
-                    self.state = "closed"
-                    log_event("circuit_breaker_closed")
-            return result
-        except Exception as e:
-            async with self._lock:
-                self.failure_count += 1
-                self.last_failure = time.time()
-                if self.failure_count >= self.threshold:
-                    self.state = "open"
-                    log_event("circuit_breaker_open", failures=self.failure_count)
-            raise
-
-class CircuitBreakerOpen(Exception):
-    pass
-
-llm_circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=30)
-
-# ================= USER MANAGEMENT (fixed lock order) =================
+# ================= USER MANAGEMENT =================
 async def get_user(uid: int):
     uid = int(uid)
     async with users_lock:
         if uid not in users:
             users[uid] = {
-                "state": STATE_IDLE, "last_experience": "", "last_active": time.time(),
-                "used_lenses": [], "integration_count": 0,
-                "_last_response": None, "_last_action": None,
-                "_last_user_reflection": None,
+                "state": STATE_IDLE,
+                "last_experience": "",
+                "last_active": time.time(),
+                "used_lenses": [],
+                "integration_count": 0,
+                "returning_user": False,
+                "self_inquiry_depth": 0,
+                "_last_response": None,
+                "_last_action": None,
+                "_last_vector_update": 0,
                 "user_vector": {"depth": 0, "clarity": 0, "resistance": 0, "stability": 0},
                 "guide_focus": "", "guide_emotion": "", "guide_control": "",
                 "collected_patterns": [],
@@ -513,7 +476,6 @@ async def get_user(uid: int):
         return users[uid]
 
 async def cleanup_users():
-    """Clean inactive users - unified lock order: workers_lock → users_lock"""
     while True:
         await asyncio.sleep(600)
         async with workers_lock:
@@ -535,12 +497,13 @@ async def cleanup_users():
         spawn(safe_save())
 
 async def cleanup_workers():
+    """Simplified worker cleanup"""
     while True:
         await asyncio.sleep(300)
         async with workers_lock:
-            done_uids = [uid for uid, w in workers.items() if w.done()]
-            for uid in done_uids:
-                workers.pop(uid, None)
+            for uid in list(workers):
+                if workers[uid].done():
+                    workers.pop(uid, None)
 
 # ================= TELEGRAM HELPERS =================
 async def send(chat_id: int, text: str):
@@ -583,7 +546,7 @@ async def send_photo(chat_id: int, img: bytes, caption: str = ""):
             else:
                 await asyncio.sleep(0.5 * (attempt + 1))
 
-# ================= LLM =================
+# ================= LLM (simplified retry) =================
 def get_system_style(user: dict) -> str:
     v = user.get("user_vector", {})
     if v.get("resistance", 0) >= 7: return "soft"
@@ -600,8 +563,7 @@ STYLE_PROMPTS = {
     "balanced": "Нейтральный аналитический стиль."
 }
 
-async def call_llm(messages, temp=0.7, max_tokens=2000, user=None):
-    """LLM call with concurrency control and circuit breaker"""
+async def call_llm(messages, temp=0.7, max_tokens=1200, user=None):
     async with llm_semaphore:
         metrics["llm_calls"] += 1
         
@@ -610,42 +572,34 @@ async def call_llm(messages, temp=0.7, max_tokens=2000, user=None):
             if style != "balanced":
                 messages = [{"role": "system", "content": STYLE_PROMPTS[style]}] + messages
         
-        async def _make_request():
-            for attempt in range(2):
-                try:
-                    r = await asyncio.wait_for(
-                        llm_http.post(
-                            "https://api.vsegpt.ru:6070/v1/chat/completions",
-                            json={
-                                "model": VSEGPT_MODEL,
-                                "messages": messages,
-                                "temperature": temp,
-                                "max_tokens": max_tokens
-                            },
-                            headers={"Authorization": f"Bearer {VSEGPT_API_KEY}"}
-                        ),
-                        timeout=65
-                    )
-                    if r.status_code == 200:
-                        data = r.json()
-                        if data.get("choices"):
-                            return data["choices"][0]["message"]["content"]
-                    if attempt < 1:
-                        await asyncio.sleep(1)
-                except asyncio.TimeoutError:
-                    log_event("llm_timeout", attempt=attempt+1)
-                    if attempt < 1:
-                        await asyncio.sleep(1)
-                except Exception as e:
-                    log_event("llm_error", error=str(e)[:200])
-                    if attempt < 1:
-                        await asyncio.sleep(1)
-            return "⚠️ Модель временно недоступна."
+        for attempt in range(2):
+            try:
+                r = await asyncio.wait_for(
+                    llm_http.post(
+                        "https://api.vsegpt.ru:6070/v1/chat/completions",
+                        json={
+                            "model": VSEGPT_MODEL,
+                            "messages": messages,
+                            "temperature": temp,
+                            "max_tokens": max_tokens
+                        },
+                        headers={"Authorization": f"Bearer {VSEGPT_API_KEY}"}
+                    ),
+                    timeout=65
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("choices"):
+                        return data["choices"][0]["message"]["content"]
+            except asyncio.TimeoutError:
+                log_event("llm_timeout", attempt=attempt+1)
+            except Exception as e:
+                log_event("llm_error", error=str(e)[:200])
+            
+            if attempt < 1:
+                await asyncio.sleep(1)
         
-        try:
-            return await llm_circuit.call(_make_request())
-        except CircuitBreakerOpen:
-            return "⚠️ Сервис временно перегружен. Пожалуйста, повтори попытку позже."
+        return "⚠️ Модель временно недоступна."
 
 # ================= PROMPTS =================
 GUIDE_REFLECTION_PROMPT = (
@@ -658,12 +612,43 @@ GUIDE_REFLECTION_PROMPT = (
 
 GUIDE_PATTERN_PROMPT = "Сформулируй один простой паттерн (1-2 предложения). Чистый русский, коротко."
 
-MIRROR_PROMPT = (
-    "Ты даёшь интерпретацию опыта в 2 слоях:\n"
-    "1. Нейрофизиология — что в теле и мозге, нормализуй.\n"
-    "2. Юнгианский слой — возможные архетипы, как гипотеза.\n"
-    "В конце: «Это только зеркало. Важно — что ты сам узнаёшь».\n"
-    "Чистый русский."
+MIRROR_PROMPT_V2 = (
+    "Ты даёшь интерпретацию опыта человека в двух уровнях: нейрофизиология и юнгианская психология.\n\n"
+
+    "СТРУКТУРА ОТВЕТА:\n\n"
+
+    "1. НЕЙРОФИЗИОЛОГИЯ (5–7 предложений)\n"
+    "- Объясни общий процесс, который прошёл человек (не пересказывай текст).\n"
+    "- Покажи, как менялись состояния: возбуждение, расслабление, ожидание, разрядка.\n"
+    "- Объясни механизм: тело, нервная система, внимание, ожидание.\n"
+    "- Разбери 1 конкретный пример из опыта (например: вибрация, звук, телесное ощущение).\n"
+    "- Не перегружай терминами. Пиши ясно.\n\n"
+
+    "2. ЮНГИАНСКИЙ СЛОЙ (4–6 предложений)\n"
+    "- Интерпретируй образы как архетипы (гипотеза, не утверждение).\n"
+    "- Свяжи это с психическим процессом (например: трансформация, контроль, отпускание, поиск ресурса).\n"
+    "- Покажи, что это может говорить о внутреннем состоянии человека.\n\n"
+
+    "3. СИНТЕЗ (2–3 предложения)\n"
+    "- Соедини тело и психику.\n"
+    "- Покажи, какой процесс проживал человек.\n"
+    "- Дай аккуратное смысловое обобщение.\n\n"
+
+    "ВАЖНО:\n"
+    "- Не пересказывай весь опыт.\n"
+    "- Не пиши длиннее 14–16 предложений.\n"
+    "- Разделяй смысловые блоки пустой строкой.\n"
+    "- Не используй markdown и списки.\n"
+    "- Пиши живым, ясным русским языком.\n"
+    "- Это гипотеза, не истина.\n\n"
+
+    "НЕ ДЕЛАЙ:\n"
+    "- Не пересказывай события опыта\n"
+    "- Не начинай с «Вы пережили...»\n"
+    "- Не перечисляй все ощущения подряд\n\n"
+
+    "Финальная фраза:\n"
+    "«Это только карта. Важно — что ты сам узнаёшь в этом.»"
 )
 
 SELF_INQUIRY_PROMPT = (
@@ -714,29 +699,83 @@ async def apply_lens(lens_key: str, experience_text: str, user: dict) -> tuple:
     return lens_key, lens["name"], result
 
 async def generate_image(prompt: str) -> bytes:
-    r = await asyncio.wait_for(
-        media_http.get(f"https://image.pollinations.ai/prompt/{quote(prompt)}"), timeout=40
-    )
-    if r.status_code != 200 or len(r.content) < 1000:
-        raise Exception("bad image")
-    return r.content
+    for attempt in range(2):
+        try:
+            r = await asyncio.wait_for(
+                media_http.get(f"https://image.pollinations.ai/prompt/{quote(prompt)}"),
+                timeout=40
+            )
+            if r.status_code == 200 and len(r.content) >= 1000:
+                return r.content
+        except:
+            if attempt == 1:
+                raise
+        await asyncio.sleep(1)
+    raise Exception("bad image")
 
 # ================= SELF-INQUIRY ENGINE =================
 async def build_mirror(user: dict, pattern: str) -> str:
+    experience = user.get("last_experience", "")[:EXPERIENCE_SWEET_SPOT]
+    
     result = await call_llm([
-        {"role": "system", "content": MIRROR_PROMPT},
-        {"role": "user", "content": f"Паттерн: {pattern}\n\nОпыт: {user.get('last_experience', '')[:500]}"}
-    ], max_tokens=600, user=user)
+        {"role": "system", "content": MIRROR_PROMPT_V2},
+        {"role": "user", "content": f"Паттерн: {pattern}\n\nОпыт:\n{experience}"}
+    ], max_tokens=MIRROR_MAX_TOKENS, user=user)
+    
+    result = ensure_complete_text(result)
+    result = trim_text(result, MIRROR_MAX_CHARS)
+    
+    result = result.replace("Нейрофизиология", "\nНейрофизиология")
+    result = result.replace("Юнгианский слой", "\nЮнгианский слой")
+    result = result.replace("Синтез", "\nСинтез")
+    
+    if len(result) < 200:
+        result += "\n\nПопробуй ещё раз описать, что именно ты почувствовал."
+    
     metrics["interpretations"] = metrics.get("interpretations", 0) + 1
     return result
 
 async def build_self_inquiry(user: dict, pattern: str) -> str:
+    experience = user.get("last_experience", "")[:EXPERIENCE_SWEET_SPOT]
     result = await call_llm([
         {"role": "system", "content": SELF_INQUIRY_PROMPT},
-        {"role": "user", "content": f"Паттерн: {pattern}\n\nОпыт: {user.get('last_experience', '')[:500]}"}
+        {"role": "user", "content": f"Паттерн: {pattern}\n\nОпыт:\n{experience}"}
     ], max_tokens=200, user=user)
+    
+    questions = [q.strip() for q in result.split("\n") if q.strip().endswith("?")]
+    if questions:
+        result = questions[0][:200].capitalize()
+    else:
+        result = result.split("\n")[0][:200].capitalize()
+    
     metrics["self_inquiries"] = metrics.get("self_inquiries", 0) + 1
     return result
+
+async def add_experience_return_block() -> dict:
+    return {
+        "text": (
+            "🌿 Теперь самое важное:\n\n"
+            "Это важнее любого объяснения.\n\n"
+            "Не анализируй.\n"
+            "На несколько секунд вернись в сам опыт.\n\n"
+            "— звук\n"
+            "— тело\n"
+            "— образы\n\n"
+            "Просто почувствуй это снова.\n\n"
+            "Когда будешь готов — можешь углубиться, посмотреть через линзу или завершить.\n\n"
+            "💡 Быстро: /neuro /jung /cbt"
+        ),
+        "keyboard": build_post_analysis_keyboard()
+    }
+
+async def delayed_return_block(uid: int):
+    """Non-blocking return block with state check"""
+    await asyncio.sleep(1.2)
+    user = await get_user(uid)
+    if user.get("state") != STATE_EXPERIENCE_RETURN:
+        return
+    return_block = await add_experience_return_block()
+    await send_response(uid, return_block)
 
 async def update_user_vector(user: dict, text: str) -> None:
     prompt = (
@@ -780,8 +819,11 @@ def route(user: dict, text: str) -> str:
     if text == "/reset": return "reset_state"
     if text == "/patterns": return "show_patterns"
 
-    lens_cmd = text[1:] if text.startswith("/") else text
-    if lens_cmd in LENS_LIBRARY: return f"lens_{lens_cmd}"
+    lens_cmd = text[1:] if text.startswith("/") else None
+    if lens_cmd and lens_cmd in LENS_LIBRARY:
+        if user.get("last_experience"):
+            return f"lens_{lens_cmd}"
+        return "start"
 
     if state == STATE_SELF_INQUIRY and text.lower() in ["всё", "хватит", "понял", "ясно"]:
         return "self_inquiry_action"
@@ -791,6 +833,12 @@ def route(user: dict, text: str) -> str:
     if state == STATE_IDLE:
         return "input_experience" if len(text.split()) >= 5 else "short_input"
     if state == STATE_SELF_INQUIRY:
+        return "self_inquiry_response"
+    if state == STATE_EXPERIENCE_RETURN:
+        if text.startswith("/"):
+            lens_cmd = text[1:]
+            if lens_cmd in LENS_LIBRARY and user.get("last_experience"):
+                return f"lens_{lens_cmd}"
         return "self_inquiry_response"
 
     v = user.get("user_vector", {})
@@ -802,9 +850,34 @@ def route(user: dict, text: str) -> str:
 # ================= DOMAIN LOGIC =================
 
 async def handle_start(user: dict) -> dict:
-    user.update({"state": STATE_IDLE, "last_experience": "", "used_lenses": [], "integration_count": 0})
+    user.update({
+        "state": STATE_IDLE, "last_experience": "", "used_lenses": [],
+        "integration_count": 0, "self_inquiry_depth": 0,
+        "guide_focus": "", "guide_emotion": "", "guide_control": ""
+    })
     spawn(safe_save())
-    return {"text": "🌿 Я — проводник осознания.\n\nОпиши, что ты пережил — и я помогу тебе пройти путь от фактов к пониманию, шаг за шагом.", "keyboard": build_menu_keyboard()}
+    
+    if user.get("returning_user"):
+        return {
+            "text": (
+                "🌿 С возвращением.\n\n"
+                "Ты можешь описать новый опыт.\n\n"
+                "Или сразу посмотреть прошлый через линзу:\n"
+                "/neuro /jung /cbt /shaman\n\n"
+                "Начни с того, что сейчас важно."
+            )
+        }
+    
+    return {
+        "text": (
+            "🌿 Я — проводник осознания.\n\n"
+            "Ты описываешь опыт — я помогаю понять, что с тобой происходило.\n\n"
+            "Опиши любой недавний опыт:\n"
+            "— ситуация\n"
+            "— ощущение в теле\n"
+            "— что тебя зацепило"
+        )
+    }
 
 async def handle_experience_input(user: dict, text: str) -> dict:
     metrics["guide_sessions"] = metrics.get("guide_sessions", 0) + 1
@@ -837,33 +910,66 @@ async def handle_pattern(user: dict, text: str) -> dict:
         {"role": "system", "content": GUIDE_PATTERN_PROMPT},
         {"role": "user", "content": user["last_experience"][:500]}
     ], max_tokens=300, user=user)
-    pattern_line = result.split("\n")[0] if "\n" in result else result
+    
+    pattern_line = (result or "").strip().split("\n")[0]
+    if not pattern_line or len(pattern_line) < 3:
+        pattern_line = "неоформленный опыт"
+    
     patterns = user.setdefault("collected_patterns", [])
     patterns.append(pattern_line)
     if len(patterns) > 50:
         patterns.pop(0)
     world = user.setdefault("user_world", {})
     world.setdefault("patterns", []).append(pattern_line)
+    
     user["state"] = STATE_SELF_INQUIRY
+    user["returning_user"] = True
+    user["self_inquiry_depth"] = 0
+    
     mirror_text = await build_mirror(user, pattern_line)
-    question = await build_self_inquiry(user, pattern_line)
+    
     spawn(safe_save())
+    
     return {
         "text": (
-            f"🧭 Я зафиксировал узор:\n\n{pattern_line}\n\n"
-            f"────────────────────\n🧠 Интерпретация:\n{mirror_text}\n\n"
-            f"────────────────────\n❓ {question}"
+            f"🧭 Паттерн:\n\n{pattern_line}\n\n"
+            f"────────────────────\n{mirror_text}"
         ),
-        "keyboard": build_self_inquiry_keyboard()
+        "keyboard": None
     }
+
+SHORT_QUESTION_WORDS = ("что", "почему", "как", "где", "зачем")
 
 async def handle_self_inquiry_response(user: dict, uid: int, text: str) -> dict:
     user_input = text[:500]
-    user["_last_user_reflection"] = user_input
     
-    # ✅ Optimize: only update vector 30% of the time
-    if random.random() < 0.3:
+    user["self_inquiry_depth"] = user.get("self_inquiry_depth", 0) + 1
+    if user["self_inquiry_depth"] > MAX_SELF_INQUIRY_DEPTH:
+        user["state"] = STATE_IDLE
+        user.update({
+            "guide_focus": "", "guide_emotion": "", "guide_control": "",
+            "self_inquiry_depth": 0
+        })
+        spawn(safe_save())
+        return {
+            "text": "🌿 Достаточно. Попробуй понаблюдать это в жизни.",
+            "keyboard": None
+        }
+    
+    if ("?" in text 
+        and len(text.split()) < 10 
+        and any(w in text.lower() for w in SHORT_QUESTION_WORDS)):
+        return {
+            "text": "Я говорил про ощущения в твоём опыте.\n\n"
+                    "Что из этого откликается тебе сейчас сильнее?",
+            "keyboard": build_post_analysis_keyboard()
+        }
+    
+    # STABLE: rate-limited vector updates
+    if (len(user_input) > 60 
+        and time.time() - user.get("_last_vector_update", 0) > 120):
         await update_user_vector(user, user_input)
+        user["_last_vector_update"] = time.time()
     
     mode = choose_inquiry_mode(user)
     trace(uid, "self_inquiry_mode", mode, user.get("user_vector", {}))
@@ -874,7 +980,7 @@ async def handle_self_inquiry_response(user: dict, uid: int, text: str) -> dict:
     ], max_tokens=200, user=user)
     if mode == "silence":
         return {"text": result}
-    return {"text": f"{result}", "keyboard": build_self_inquiry_keyboard()}
+    return {"text": f"{result}", "keyboard": build_post_analysis_keyboard()}
 
 async def handle_self_inquiry_action(user: dict, text: str) -> dict | None:
     sub = text.split(":", 1)[1] if ":" in text else text
@@ -889,20 +995,34 @@ async def handle_self_inquiry_action(user: dict, text: str) -> dict | None:
         spawn(safe_save())
         return {"text": result}
     elif sub == "lens":
-        user["state"] = STATE_LENS
-        return {"text": "Выбери, через что посмотреть:", "keyboard": build_menu_keyboard()}
+        user["state"] = STATE_IDLE
+        return {
+            "text": "Хорошо. Давай посмотрим на этот же опыт с другой стороны.\n\nВыбери линзу:",
+            "keyboard": build_menu_keyboard()
+        }
     elif sub == "end":
         user["state"] = STATE_IDLE
+        user.update({
+            "guide_focus": "", "guide_emotion": "", "guide_control": "",
+            "self_inquiry_depth": 0
+        })
         spawn(safe_save())
         return {"text": "🌿 Принято. Ты можешь понаблюдать это в жизни или принести новый опыт."}
     return None
 
 async def handle_lens(user: dict, lens_key: str) -> dict:
     if not user.get("last_experience"):
-        return {"text": "Сначала расскажи опыт."}
+        return {
+            "text": (
+                "Сначала нужен опыт.\n\n"
+                "Опиши, что ты пережил — и я разберу это через выбранную линзу."
+            )
+        }
     lens_key, lens_name, lresult = await apply_lens(lens_key, user["last_experience"], user)
-    record_action(f"lens_{lens_key}")
-    user.setdefault("used_lenses", []).append(lens_key)
+    lst = user.setdefault("used_lenses", [])
+    lst.append(lens_key)
+    if len(lst) > 50:
+        lst.pop(0)
     user["state"] = STATE_IDLE
     spawn(safe_save())
     return {"text": f"Смотрю через «{lens_name}».\n\n{lresult}\n\nЧто ты возьмёшь из этого в следующий раз?"}
@@ -911,13 +1031,22 @@ async def handle_lens(user: dict, lens_key: str) -> dict:
 async def execute(uid: int, action: str, text: str) -> dict | None:
     user = await get_user(uid)
     trace(uid, action, "exec_start")
-    if user.get("_last_action") == action and action in ("short_input", "end"):
+    if user.get("_last_action") == action and action == "short_input":
         return None
     user["_last_action"] = action
 
     if action == "start": return await handle_start(user)
     if action == "reset_state":
-        user.update({"used_lenses": [], "integration_count": 0, "state": STATE_IDLE})
+        user.update({
+            "used_lenses": [],
+            "integration_count": 0,
+            "state": STATE_IDLE,
+            "last_experience": "",
+            "guide_focus": "",
+            "guide_emotion": "",
+            "guide_control": "",
+            "self_inquiry_depth": 0
+        })
         spawn(safe_save())
         return {"text": "🔄 Пространство очищено."}
     if action == "show_menu": return {"text": "🎯 Выбери линзу:", "keyboard": build_menu_keyboard()}
@@ -951,28 +1080,24 @@ async def execute(uid: int, action: str, text: str) -> dict | None:
         user["state"] = STATE_SELF_INQUIRY
         world = user.get("user_world", {})
         patterns = world.get("patterns", [])
-        last_pattern = patterns[-1] if patterns else ""
+        last_pattern = patterns[-1] if patterns else "неоформленный опыт"
         mirror_text = await build_mirror(user, last_pattern)
-        question = await build_self_inquiry(user, last_pattern)
         spawn(safe_save())
         return {
-            "text": f"🧠 Интерпретация:\n{mirror_text}\n\n────────────────────\n❓ {question}",
-            "keyboard": build_self_inquiry_keyboard()
+            "text": f"🧠 Интерпретация:\n{mirror_text}",
+            "keyboard": None
         }
 
     if action == "self_inquiry_response": return await handle_self_inquiry_response(user, uid, text)
     if action == "self_inquiry_action": return await handle_self_inquiry_action(user, text)
-    if action == "deep":
-        user["state"] = STATE_DEEP
-        result = await call_llm([
-            {"role": "system", "content": GUIDE_DEEP_PROMPT},
-            {"role": "user", "content": user["last_experience"][:500]}
-        ], max_tokens=150, user=user)
-        spawn(safe_save())
-        return {"text": result}
-    if action == "lens_choice": user["state"] = STATE_LENS; return {"text": "Выбери, через что посмотреть:", "keyboard": build_menu_keyboard()}
+    if action == "lens_choice": user["state"] = STATE_IDLE; return {"text": "Выбери, через что посмотреть:", "keyboard": build_menu_keyboard()}
     if action == "end":
-        user["state"] = STATE_IDLE; spawn(safe_save())
+        user["state"] = STATE_IDLE
+        user.update({
+            "guide_focus": "", "guide_emotion": "", "guide_control": "",
+            "self_inquiry_depth": 0
+        })
+        spawn(safe_save())
         return {"text": "Ты можешь понаблюдать это в жизни или принести новый опыт. Я здесь."}
 
     if action.startswith("lens_"): return await handle_lens(user, action.replace("lens_", ""))
@@ -1002,7 +1127,12 @@ async def execute(uid: int, action: str, text: str) -> dict | None:
 
 # ================= WORKER =================
 async def worker(uid: int):
-    q = queues[uid]
+    # STABLE: safe queue access
+    q = queues.get(uid)
+    if not q:
+        log_event("worker_no_queue", uid=uid)
+        return
+    
     try:
         while True:
             msg = await q.get()
@@ -1011,23 +1141,36 @@ async def worker(uid: int):
                 user = await get_user(uid)
                 metrics["requests"] += 1
                 action = route(user, msg)
-                record_action(action)
                 response = await execute(uid, action, msg)
+                
                 if not response:
                     log_event("empty_response_worker", uid=uid, action=action)
                     continue
+                
                 last = user.get("_last_response")
-                if last and response.get("text") == last.get("text"): continue
+                if last and response.get("text") == last.get("text"):
+                    continue
                 user["_last_response"] = response
                 await send_response(uid, response)
+                
+                if action == "pattern" or action == "mirror_entry":
+                    user["state"] = STATE_EXPERIENCE_RETURN
+                    spawn(delayed_return_block(uid))
+                    
     except Exception as e:
         log_event("worker_crash", uid=uid, error=str(e)[:500])
     finally:
         log_event("worker_stopped", uid=uid)
 
 async def enqueue(uid: int, text: str):
-    # Rate limit check
+    # STABLE: cooldown with feedback
+    if not check_user_cooldown(uid):
+        spawn(send(uid, "⏳ Подожди секунду"))
+        return
+    
+    # STABLE: rate limit with feedback
     if not check_rate_limit(uid):
+        spawn(send(uid, "⏳ Слишком часто, подожди немного"))
         log_event("rate_limited", uid=uid)
         return
     
@@ -1041,25 +1184,24 @@ async def enqueue(uid: int, text: str):
         
         q = queues[uid]
         
-        # Backpressure: don't drop, wait briefly
         if q.full():
             try:
                 await asyncio.wait_for(q.put(text), timeout=0.2)
                 return
             except asyncio.TimeoutError:
-                record_error("queue_overflow")
                 log_event("queue_overflow", uid=uid)
                 return
         
         try:
             q.put_nowait(text)
         except asyncio.QueueFull:
-            record_error("queue_full")
             log_event("queue_full", uid=uid)
             return
         
-        if uid not in workers or workers[uid].done():
-            workers[uid] = spawn(worker(uid))
+        # STABLE: race-free worker creation
+        async with workers_lock:
+            if uid not in workers or workers[uid].done():
+                workers[uid] = spawn(worker(uid))
 
 # ================= WEBHOOK =================
 @app.post("/webhook")
@@ -1077,8 +1219,8 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
         chat_id = callback["message"]["chat"]["id"]
         dtext = callback.get("data", "")
         
-        # ✅ Protect against huge callback_data
         if len(dtext) > MAX_CALLBACK_DATA:
+            log_event("callback_too_long", size=len(dtext))
             return {"ok": True}
         
         await answer_callback(cid)
@@ -1098,7 +1240,6 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
     chat_id = msg["chat"]["id"]
     save_user_to_memory(chat_id)
     
-    # Admin broadcast logic
     if chat_id == ADMIN_ID:
         photo = msg.get("photo")
         voice = msg.get("voice")
@@ -1137,11 +1278,7 @@ async def health():
         "users": len(users),
         "workers": len(workers),
         "active_workers": sum(1 for w in workers.values() if not w.done()),
-        "background_tasks": len(background_tasks),
         "user_ids_set": len(user_ids_set),
-        "rate_limit_buckets": len(user_rate_limit),
-        "dedup_entries": len(processed_updates),
-        "circuit_breaker": llm_circuit.state,
         "metrics": metrics
     }
 
