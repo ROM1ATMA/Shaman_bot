@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import time
-import asyncio
 import re
 import random
 import traceback
@@ -25,13 +24,11 @@ if not BOT_TOKEN: raise RuntimeError("❌ BOT_TOKEN empty")
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 ADMIN_ID = 781629557
 USER_TTL = 3600
-MAX_QUEUE_SIZE = 100
 MAX_INPUT_LENGTH = 4000
 MAX_SELF_INQUIRY_DEPTH = 5
-LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "20"))
 
-MIRROR_MAX_TOKENS = 900
-MIRROR_MAX_CHARS = 1500
+MIRROR_MAX_TOKENS = 1000
+MIRROR_MAX_CHARS = 1800
 EXPERIENCE_SWEET_SPOT = 800
 
 # ================= LOGGING =================
@@ -52,36 +49,7 @@ STATE_EMOTION = "emotion"
 STATE_PATTERN = "pattern"
 STATE_SELF_INQUIRY = "self_inquiry"
 STATE_DEEP = "deep"
-STATE_IMAGE = "image"
 STATE_EXPERIENCE_RETURN = "experience_return"
-
-# 🔥 FIXED: Proper transitions
-TRANSITIONS = {
-    STATE_IDLE: {
-        "start": "start",
-        "input_experience": "input_experience",
-        "short_input": "short_input",
-        "show_menu": "show_menu",
-        "show_patterns": "show_patterns",
-        "reset_state": "reset_state",
-    },
-    STATE_REFLECTION: {"*": "focus"},  # Any input after reflection → focus
-    STATE_FOCUS: {"*": "emotion"},      # Any input after focus → emotion
-    STATE_EMOTION: {"*": "pattern"},    # Any input after emotion → pattern
-    STATE_PATTERN: {"*": "mirror_entry"}, # Any input after pattern → mirror
-    STATE_SELF_INQUIRY: {
-        "self_inquiry_response": "self_inquiry_response",
-        "self_inquiry_action": "self_inquiry_action",
-        "end": "end",
-    },
-    STATE_DEEP: {"*": "end"},
-    STATE_IMAGE: {"*": "image"},
-    STATE_EXPERIENCE_RETURN: {
-        "self_inquiry_response": "self_inquiry_response",
-        "self_inquiry_action": "self_inquiry_action",
-        "end": "end",
-    },
-}
 
 users = {}
 user_rate_limit = {}
@@ -214,25 +182,48 @@ GUIDE_REFLECTION_PROMPT = (
 GUIDE_PATTERN_PROMPT = "Сформулируй один простой паттерн (1-2 предложения). Чистый русский, коротко."
 
 MIRROR_PROMPT_V2 = (
-    "Ты даёшь интерпретацию опыта человека в двух уровнях: нейрофизиология и юнгианская психология.\n\n"
-    "СТРУКТУРА ОТВЕТА:\n\n"
-    "1. НЕЙРОФИЗИОЛОГИЯ (5–7 предложений)\n"
-    "- Объясни общий процесс, который прошёл человек (не пересказывай текст).\n"
-    "- Покажи, как менялись состояния: возбуждение, расслабление, ожидание, разрядка.\n"
-    "- Объясни механизм: тело, нервная система, внимание, ожидание.\n"
-    "- Разбери 1 конкретный пример из опыта.\n"
-    "- Не перегружай терминами. Пиши ясно.\n\n"
-    "2. ЮНГИАНСКИЙ СЛОЙ (4–6 предложений)\n"
-    "- Интерпретируй образы как архетипы (гипотеза, не утверждение).\n"
-    "- Свяжи это с психическим процессом (трансформация, контроль, отпускание, поиск ресурса).\n"
-    "- Покажи, что это может говорить о внутреннем состоянии человека.\n\n"
-    "3. СИНТЕЗ (2–3 предложения)\n"
-    "- Соедини тело и психику.\n"
-    "- Покажи, какой процесс проживал человек.\n"
-    "- Дай аккуратное смысловое обобщение.\n\n"
-    "ВАЖНО: Не пересказывай весь опыт. Не пиши длиннее 14–16 предложений. "
-    "Пиши живым, ясным русским языком. Это гипотеза, не истина.\n\n"
-    "Финальная фраза: «Это только карта. Важно — что ты сам узнаёшь в этом.»"
+    "Ты даёшь интерпретацию опыта человека через тело и глубинную психику.\n\n"
+
+    "СТРУКТУРА ОТВЕТА (строго):\n\n"
+
+    "1. НЕЙРОФИЗИОЛОГИЯ (3–4 предложения)\n"
+    "- Опиши, как мозг и тело прошли через этот опыт: какие волны (гамма, тета, дельта) включались, "
+    "как сменялись напряжение и расслабление.\n"
+    "- Используй простые образы: «мозг переключился», «тело зависло между», «нервная система выдохнула».\n"
+    "- Не перегружай терминами. Говори о процессе, а не об анатомии.\n"
+    "- Свяжи с тем, что человек чувствовал: «ты ждал разрядки, но тело не успело».\n\n"
+
+    "2. ЮНГИАНСКИЙ СЛОЙ (6–10 предложений — это главный блок)\n"
+    "- Возьми КАЖДЫЙ значимый образ из опыта и раскрой его как архетип:\n"
+    "  • Звук, колокольчик, бубен → архетип Проводника, Зовущего\n"
+    "  • Вибрация, желание поднять её → архетип Трансформации, Кундалини\n"
+    "  • Лягушка с монеткой → архетип Хранителя ресурса, Перехода\n"
+    "  • Череп → дракон → архетип Смерти-Возрождения, Тени\n"
+    "  • Бунгало, костёр → архетип Убежища, Центра\n"
+    "- Покажи СВЯЗЬ между образами: как они выстраиваются в историю.\n"
+    "- Используй формулировки: «похоже на», «может указывать», «как будто».\n"
+    "- Говори о человеке, а не о мифах: «в тебе есть ресурс, который пока не проявлен».\n\n"
+
+    "3. СИНТЕЗ (1–2 предложения)\n"
+    "- Одной фразой: какой внутренний процесс идёт прямо сейчас.\n\n"
+
+    "ФОРМАТ:\n"
+    "Разделяй блоки заголовками с эмодзи.\n"
+    "Пиши живым, тёплым русским языком.\n"
+    "Общий объём: не больше 20 предложений.\n"
+    "Это гипотеза, а не истина — не утверждай, а приглашай к размышлению.\n\n"
+
+    "После интерпретации добавь ОБЯЗАТЕЛЬНЫЙ блок:\n\n"
+
+    "4. ПРИГЛАШЕНИЕ (3–4 предложения)\n"
+    "- Напомни: эти образы — сугубо индивидуальны. Только сам человек знает, что они значат.\n"
+    "- Все интерпретации — лишь зеркало. Что-то откликнется, что-то нет.\n"
+    "- Задай ОДИН уточняющий вопрос про конкретный момент из опыта — "
+    "про чувство, телесное ощущение или образ, где не хватает ясности.\n"
+    "- Предложи: «Если хочешь — можем разобрать это глубже. Или посмотреть через другую линзу.»\n\n"
+
+    "Финальная фраза (обязательно, после приглашения):\n"
+    "«Это только зеркало. Важно — что ты сам узнаёшь в этом.»"
 )
 
 SELF_INQUIRY_PROMPT = (
@@ -292,13 +283,12 @@ def build_control_keyboard() -> dict:
         [{"text": "🤷 Не знаю", "callback_data": "control:не знаю"}],
     ]}
 
-# ================= ROUTING (FIXED) =================
+# ================= ROUTING =================
 def route(user: dict, text: str) -> str:
     state = user["state"]
     
     log(f"Route: state={state} text={text[:50]}")
 
-    # Commands that work in any state
     if text.startswith("self_inquiry:"): return "self_inquiry_action"
     if text.startswith("emotion:"): return "emotion"
     if text.startswith("control:"): return "pattern"
@@ -308,25 +298,23 @@ def route(user: dict, text: str) -> str:
     if text == "/reset": return "reset_state"
     if text == "/patterns": return "show_patterns"
 
-    # Lens commands
     lens_cmd = text[1:] if text.startswith("/") else None
     if lens_cmd and lens_cmd in LENS_LIBRARY:
         if user.get("last_experience"):
             return f"lens_{lens_cmd}"
         return "start"
 
-    # 🔥 FIXED: State-specific routing
     if state == STATE_REFLECTION:
-        return "focus"  # Any text → focus
+        return "focus"
     
     if state == STATE_FOCUS:
-        return "emotion"  # Any text → emotion
+        return "emotion"
     
     if state == STATE_EMOTION:
-        return "pattern"  # Any text → pattern
+        return "pattern"
     
     if state == STATE_PATTERN:
-        return "mirror_entry"  # Any text → mirror
+        return "mirror_entry"
     
     if state == STATE_SELF_INQUIRY:
         if text.lower() in ["всё", "хватит", "понял", "ясно"]:
@@ -343,7 +331,6 @@ def route(user: dict, text: str) -> str:
     if state == STATE_DEEP:
         return "end"
     
-    # Default: idle
     if state == STATE_IDLE:
         return "input_experience" if len(text.split()) >= 5 else "short_input"
 
@@ -536,13 +523,9 @@ def add_experience_return_block() -> dict:
     return {
         "text": (
             "🌿 Теперь самое важное:\n\n"
-            "Это важнее любого объяснения.\n\n"
-            "Не анализируй.\n"
-            "На несколько секунд вернись в сам опыт.\n\n"
-            "— звук\n— тело\n— образы\n\n"
-            "Просто почувствуй это снова.\n\n"
-            "Когда будешь готов — можешь углубиться, посмотреть через линзу или завершить.\n\n"
-            "💡 Быстро: /neuro /jung /cbt"
+            "Эти образы — сугубо индивидуальны. Только ты знаешь, что они значат для тебя.\n"
+            "Все интерпретации — лишь зеркало. Что-то откликнется, что-то нет.\n\n"
+            "Если хочешь — можем разобрать глубже или посмотреть через другую линзу."
         ),
         "keyboard": build_post_analysis_keyboard()
     }
@@ -577,7 +560,6 @@ def execute(uid: int, action: str, text: str) -> dict | None:
         ], max_tokens=300, user=user)
         return {"text": result}
     
-    # 🔥 FIXED: These must happen in sequence
     if action == "focus": return handle_focus(user, text)
     if action == "emotion": return handle_emotion(user, text)
     if action == "pattern":
@@ -605,7 +587,6 @@ def execute(uid: int, action: str, text: str) -> dict | None:
 
 # ================= PROCESS MESSAGE =================
 def process_message(chat_id: int, text: str) -> None:
-    """Main entry point for processing user messages"""
     user = get_user(chat_id)
     
     if not text:
@@ -617,25 +598,24 @@ def process_message(chat_id: int, text: str) -> None:
     
     if response:
         send_message(chat_id, response.get("text", ""), response.get("keyboard"))
-        
-        # After pattern: set state and send return block
-        if action in ("pattern",):
-            user["state"] = STATE_EXPERIENCE_RETURN
-            save_users_sync()
-            time.sleep(0.8)
-            return_block = add_experience_return_block()
-            send_message(chat_id, return_block["text"], return_block["keyboard"])
-        
-        # After mirror_entry: set state and send return block
-        if action == "mirror_entry":
-            user["state"] = STATE_EXPERIENCE_RETURN
-            save_users_sync()
-            time.sleep(0.8)
-            return_block = add_experience_return_block()
-            send_message(chat_id, return_block["text"], return_block["keyboard"])
+    
+    # 🔥 ГАРАНТИРОВАННАЯ отправка меню после pattern
+    if action == "pattern":
+        user["state"] = STATE_EXPERIENCE_RETURN
+        save_users_sync()
+        time.sleep(0.5)
+        return_block = add_experience_return_block()
+        send_message(chat_id, return_block["text"], return_block["keyboard"])
+    
+    # 🔥 ГАРАНТИРОВАННАЯ отправка меню после mirror_entry
+    if action == "mirror_entry":
+        user["state"] = STATE_EXPERIENCE_RETURN
+        save_users_sync()
+        time.sleep(0.5)
+        return_block = add_experience_return_block()
+        send_message(chat_id, return_block["text"], return_block["keyboard"])
 
 def process_callback(chat_id: int, data: str) -> None:
-    """Process inline keyboard callbacks"""
     user = get_user(chat_id)
     
     if not data:
@@ -649,7 +629,7 @@ def process_callback(chat_id: int, data: str) -> None:
 
 # ================= WEBHOOK HANDLER =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/10.0-STABLE"
+    server_version = "ShamanBot/10.1-MIRROR"
     
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -686,7 +666,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         body = raw.decode("utf-8", errors="replace")
         
         log(f"Webhook: {len(raw)} bytes")
-        log(f"Payload: {body[:500]}")
+        log(f"Payload: {body[:300]}")
         
         try:
             update = json.loads(body) if body else {}
@@ -694,7 +674,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "Invalid JSON"})
             return
         
-        # Callback query
         callback = update.get("callback_query")
         if callback:
             cid = callback.get("id", "")
@@ -711,7 +690,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True})
             return
         
-        # Message
         message = update.get("message") or update.get("edited_message") or {}
         chat = message.get("chat", {})
         chat_id = chat.get("id")
@@ -753,7 +731,7 @@ def main() -> int:
         log("WARNING: BOT_TOKEN empty")
     
     server = HTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v10.0-STABLE on {HOST}:{PORT}")
+    log(f"ShamanBot v10.1-MIRROR on {HOST}:{PORT}")
     
     try:
         server.serve_forever()
