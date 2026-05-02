@@ -4,13 +4,12 @@ import sys
 import time
 import re
 import random
+import html
 import traceback
 import httpx
 from urllib.parse import quote
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib import request, error
-from collections import deque, defaultdict
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -25,11 +24,16 @@ VSEGPT_MODEL = "deepseek/deepseek-chat"
 ADMIN_ID = 781629557
 USER_TTL = 3600
 MAX_INPUT_LENGTH = 4000
-MAX_SELF_INQUIRY_DEPTH = 5
 
-MIRROR_MAX_TOKENS = 1000
-MIRROR_MAX_CHARS = 1800
+MIRROR_MAX_TOKENS = 600
+MAX_TELEGRAM_CHARS = 3900
 EXPERIENCE_SWEET_SPOT = 800
+MIN_EXPERIENCE_LENGTH = 15
+
+# 🔒 NEW: Launch-safe config
+RATE_LIMIT_SECONDS = 2
+DUPLICATE_TTL = 5
+THINKING_MESSAGE = "…смотрю на это"
 
 # ================= LOGGING =================
 def utc_now() -> str:
@@ -38,22 +42,13 @@ def utc_now() -> str:
 def log(message: str) -> None:
     print(f"[{utc_now()}] {message}", flush=True)
 
-def log_event(event: str, uid: int = 0, **kwargs):
-    log(json.dumps({"event": event, "uid": uid, **kwargs}, ensure_ascii=False))
-
 # ================= STATE MACHINE =================
 STATE_IDLE = "idle"
-STATE_REFLECTION = "reflection"
-STATE_FOCUS = "focus"
-STATE_EMOTION = "emotion"
-STATE_PATTERN = "pattern"
-STATE_SELF_INQUIRY = "self_inquiry"
+STATE_CONFLICT = "conflict"
+STATE_REWRITE = "rewrite"
 STATE_DEEP = "deep"
-STATE_EXPERIENCE_RETURN = "experience_return"
 
 users = {}
-user_rate_limit = {}
-last_request_time = {}
 
 # ================= USERS =================
 def load_users():
@@ -80,13 +75,18 @@ def get_user(uid: int) -> dict:
             "state": STATE_IDLE,
             "last_experience": "",
             "last_active": time.time(),
+            "last_key_moment": "",
             "used_lenses": [],
             "returning_user": False,
-            "self_inquiry_depth": 0,
+            "chosen_view": "",
+            "identity_story": [],
+            "rewrite_history": [],
+            "_conflict_views": {},
+            "_conflict_moment": "",
+            # 🔒 NEW: rate limit + dedup
+            "last_request_time": 0,
+            "last_update_hash": "",
             "user_vector": {"depth": 5, "clarity": 5, "resistance": 5, "stability": 5},
-            "guide_focus": "", "guide_emotion": "", "guide_control": "",
-            "collected_patterns": [],
-            "user_world": {"patterns": [], "events": [], "interpretation_nodes": []}
         }
         save_users_sync()
     users[uid]["last_active"] = time.time()
@@ -113,7 +113,8 @@ def telegram_api(method: str, payload: dict) -> dict | None:
     return None
 
 def send_message(chat_id: int, text: str, keyboard: dict = None) -> bool:
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    text = safe_text(text)
+    payload = {"chat_id": chat_id, "text": text}
     if keyboard:
         payload["reply_markup"] = keyboard
     result = telegram_api("sendMessage", payload)
@@ -122,28 +123,33 @@ def send_message(chat_id: int, text: str, keyboard: dict = None) -> bool:
 def answer_callback(callback_id: str) -> None:
     telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
 
+# ================= UTILS =================
+def safe_text(text: str) -> str:
+    """Экранируем HTML и режем под Telegram"""
+    text = html.escape(text or "")
+    if len(text) > MAX_TELEGRAM_CHARS:
+        return text[:MAX_TELEGRAM_CHARS]
+    return text
+
+# 🔒 NEW: Защита от спама и дубликатов
+def is_rate_limited(user: dict) -> bool:
+    now = time.time()
+    if now - user.get("last_request_time", 0) < RATE_LIMIT_SECONDS:
+        return True
+    user["last_request_time"] = now
+    return False
+
+def is_duplicate(user: dict, text: str) -> bool:
+    h = str(hash(text.strip()))
+    if user.get("last_update_hash") == h:
+        return True
+    user["last_update_hash"] = h
+    return False
+
 # ================= LLM =================
 def call_llm_sync(messages, temp=0.7, max_tokens=1200, user=None) -> str:
     if not VSEGPT_API_KEY:
         return "⚠️ API ключ не настроен."
-    
-    if user:
-        v = user.get("user_vector", {})
-        style = "balanced"
-        if v.get("resistance", 0) >= 7: style = "soft"
-        elif v.get("clarity", 0) >= 8: style = "precise"
-        elif v.get("depth", 0) >= 7: style = "symbolic"
-        elif v.get("stability", 0) <= 3: style = "grounding"
-        
-        style_prompts = {
-            "soft": "Говори мягко, не дави.",
-            "precise": "Будь точным и структурным.",
-            "symbolic": "Допускай символы и архетипы.",
-            "grounding": "Фокус на теле и реальности.",
-            "balanced": "Нейтральный аналитический стиль."
-        }
-        if style != "balanced":
-            messages = [{"role": "system", "content": style_prompts[style]}] + messages
     
     for attempt in range(2):
         try:
@@ -170,466 +176,432 @@ def call_llm_sync(messages, temp=0.7, max_tokens=1200, user=None) -> str:
     
     return "⚠️ Модель временно недоступна."
 
+def safe_llm(messages, user=None, **kwargs) -> str | None:
+    """Единая обёртка с fallback"""
+    try:
+        result = call_llm_sync(messages, user=user, **kwargs)
+        if not result or "⚠️" in result:
+            return None
+        return result
+    except Exception as e:
+        log(f"LLM CRASH: {e}")
+        return None
+
+def send_thinking(chat_id: int) -> None:
+    """UX: показываем что бот думает"""
+    send_message(chat_id, THINKING_MESSAGE)
+
 # ================= PROMPTS =================
-GUIDE_REFLECTION_PROMPT = (
-    "Ты — внимательный проводник.\n\n"
-    "1. Коротко (2-3 предложения) отрази, что человек пережил — конкретно, без мистики.\n"
-    "2. Выдели 2-3 ключевых момента опыта (телесное, эмоции, образы).\n"
-    "3. Задай один простой вопрос: «Где в этом опыте было самое сильное место?»\n\n"
-    "Без поэзии. Без абстракций. Ясно и по делу. Чистый русский, без маркдауна."
+KEY_MOMENT_PROMPT = (
+    "Найди в опыте момент внутреннего напряжения или незавершённости.\n\n"
+    "Верни ОДНУ фразу (до 12 слов) — максимально конкретно.\n"
+    "Только фраза."
 )
 
-GUIDE_PATTERN_PROMPT = "Сформулируй один простой паттерн (1-2 предложения). Чистый русский, коротко."
-
-MIRROR_PROMPT_V2 = (
-    "Ты даёшь интерпретацию опыта человека через тело и глубинную психику.\n\n"
-
-    "СТРУКТУРА ОТВЕТА (строго):\n\n"
-
-    "1. НЕЙРОФИЗИОЛОГИЯ (3–4 предложения)\n"
-    "- Опиши, как мозг и тело прошли через этот опыт: какие волны (гамма, тета, дельта) включались, "
-    "как сменялись напряжение и расслабление.\n"
-    "- Используй простые образы: «мозг переключился», «тело зависло между», «нервная система выдохнула».\n"
-    "- Не перегружай терминами. Говори о процессе, а не об анатомии.\n"
-    "- Свяжи с тем, что человек чувствовал: «ты ждал разрядки, но тело не успело».\n\n"
-
-    "2. ЮНГИАНСКИЙ СЛОЙ (6–10 предложений — это главный блок)\n"
-    "- Возьми КАЖДЫЙ значимый образ из опыта и раскрой его как архетип:\n"
-    "  • Звук, колокольчик, бубен → архетип Проводника, Зовущего\n"
-    "  • Вибрация, желание поднять её → архетип Трансформации, Кундалини\n"
-    "  • Лягушка с монеткой → архетип Хранителя ресурса, Перехода\n"
-    "  • Череп → дракон → архетип Смерти-Возрождения, Тени\n"
-    "  • Бунгало, костёр → архетип Убежища, Центра\n"
-    "- Покажи СВЯЗЬ между образами: как они выстраиваются в историю.\n"
-    "- Используй формулировки: «похоже на», «может указывать», «как будто».\n"
-    "- Говори о человеке, а не о мифах: «в тебе есть ресурс, который пока не проявлен».\n\n"
-
-    "3. СИНТЕЗ (1–2 предложения)\n"
-    "- Одной фразой: какой внутренний процесс идёт прямо сейчас.\n\n"
-
-    "ФОРМАТ:\n"
-    "Разделяй блоки заголовками с эмодзи.\n"
-    "Пиши живым, тёплым русским языком.\n"
-    "Общий объём: не больше 20 предложений.\n"
-    "Это гипотеза, а не истина — не утверждай, а приглашай к размышлению.\n\n"
-
-    "После интерпретации добавь ОБЯЗАТЕЛЬНЫЙ блок:\n\n"
-
-    "4. ПРИГЛАШЕНИЕ (3–4 предложения)\n"
-    "- Напомни: эти образы — сугубо индивидуальны. Только сам человек знает, что они значат.\n"
-    "- Все интерпретации — лишь зеркало. Что-то откликнется, что-то нет.\n"
-    "- Задай ОДИН уточняющий вопрос про конкретный момент из опыта — "
-    "про чувство, телесное ощущение или образ, где не хватает ясности.\n"
-    "- Предложи: «Если хочешь — можем разобрать это глубже. Или посмотреть через другую линзу.»\n\n"
-
-    "Финальная фраза (обязательно, после приглашения):\n"
-    "«Это только зеркало. Важно — что ты сам узнаёшь в этом.»"
+MIRROR_PROMPT_V3 = (
+    "Ты возвращаешь человека ВНУТРЬ его опыта.\n"
+    "1. УЗНАВАНИЕ (2–3 предл.) — опиши что происходило, используй 'ты'.\n"
+    "2. НАПРЯЖЕНИЕ (2–4 предл.) — покажи момент где что-то НЕ ДОШЛО.\n"
+    "3. УГЛУБЛЕНИЕ (2–3 предл.) — мягко предположи что под этим.\n"
+    "Стиль: живой русский, без терминов, без советов, без вопросов."
 )
 
-SELF_INQUIRY_PROMPT = (
-    "Верни пользователя к его субъективному опыту.\n"
-    "Задай вопросы: Что ты сам чувствуешь? Что здесь твоё? С чем ты согласен?\n"
-    "2-3 коротких вопроса. Чистый русский."
+NEURO_PROMPT = (
+    "Ты нейрофизиолог. Объясни этот опыт через тело и мозг: процессы, волны, нейромедиаторы. "
+    "Коротко, ясно, без терминов."
 )
 
-GUIDE_DEEP_PROMPT = "Задай один глубокий вопрос: «Если убрать ожидание — что ты на самом деле хотел почувствовать?»"
+JUNG_PROMPT = (
+    "Ты юнгианский аналитик. Интерпретируй образы как архетипы. "
+    "Покажи связь между ними. Используй: 'похоже на', 'может указывать'."
+)
 
-LENS_LIBRARY = {
-    "neuro": {"name": "Нейрофизиология", "prompt": "Ты — нейрофизиолог."},
-    "cbt": {"name": "КПТ", "prompt": "Ты — КПТ-терапевт."},
-    "jung": {"name": "Юнг", "prompt": "Ты — юнгианский аналитик."},
-    "shaman": {"name": "Шаманизм", "prompt": "Ты — шаман."},
-    "tarot": {"name": "Таро", "prompt": "Ты — мастер Таро."},
-    "yoga": {"name": "Йога", "prompt": "Ты — мастер йоги."},
-    "hindu": {"name": "Адвайта", "prompt": "Ты — учитель адвайты."},
-    "field": {"name": "Поле", "prompt": "Ты — голос Поля."},
-    "architect": {"name": "Архитектор", "prompt": "Ты — Архитектор сознания."},
-    "witness": {"name": "Наблюдатель", "static_text": "Что бы ты ни переживал — это осознаётся."},
-    "stalker": {"name": "Сталкер", "prompt": "Ты — безмолвное присутствие."},
-}
+REWRITE_SYSTEM_A = (
+    "Ты объясняешь опыт через тело, нервную систему и реакции. "
+    "Сформируй вывод: если смотреть через эту версию, кто человек в этом опыте? "
+    "Начни с: «Если смотреть отсюда, ты — тот, кто...»"
+)
+
+REWRITE_SYSTEM_B = (
+    "Ты объясняешь опыт через смысл, архетипы и внутренние сюжеты. "
+    "Сформируй вывод: если смотреть через эту версию, кто человек в этом опыте? "
+    "Начни с: «Если смотреть отсюда, ты — тот, кто...»"
+)
 
 # ================= KEYBOARDS =================
-def build_menu_keyboard() -> dict:
+def build_conflict_keyboard() -> dict:
     return {"inline_keyboard": [
-        [{"text": "🧠 Нейро", "callback_data": "neuro"}, {"text": "💭 КПТ", "callback_data": "cbt"}],
-        [{"text": "🏺 Юнг", "callback_data": "jung"}, {"text": "🦅 Шаман", "callback_data": "shaman"}],
-        [{"text": "🃏 Таро", "callback_data": "tarot"}, {"text": "🧘 Йога", "callback_data": "yoga"}],
-        [{"text": "🕉️ Адвайта", "callback_data": "hindu"}, {"text": "🌐 Поле", "callback_data": "field"}],
-        [{"text": "👁️ Наблюдатель", "callback_data": "witness"}, {"text": "🎯 Сталкер", "callback_data": "stalker"}],
-        [{"text": "🏛️ Архитектор", "callback_data": "architect"}],
+        [{"text": "🔬 А — это про тело", "callback_data": "choice_A"}],
+        [{"text": "🏺 B — это про смысл", "callback_data": "choice_B"}],
     ]}
 
-def build_post_analysis_keyboard() -> dict:
+def build_rewrite_keyboard() -> dict:
     return {"inline_keyboard": [
         [{"text": "🕳 Углубиться", "callback_data": "self_inquiry:deep"}],
-        [{"text": "🔍 Посмотреть через линзу", "callback_data": "self_inquiry:lens"}],
+        [{"text": "🔄 Новый опыт", "callback_data": "reset"}],
         [{"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
 
-def build_emotion_keyboard() -> dict:
-    return {"inline_keyboard": [
-        [{"text": "😨 Страх", "callback_data": "emotion:страх"}],
-        [{"text": "😤 Напряжение", "callback_data": "emotion:напряжение"}],
-        [{"text": "🤔 Интерес", "callback_data": "emotion:интерес"}],
-        [{"text": "😞 Разочарование", "callback_data": "emotion:разочарование"}],
-        [{"text": "😌 Принятие", "callback_data": "emotion:принятие"}],
-        [{"text": "✍️ Другое", "callback_data": "emotion:другое"}],
-    ]}
+# ================= HOOK ENGINE =================
+def extract_key_moment(text: str, user: dict = None) -> str:
+    result = safe_llm([
+        {"role": "system", "content": KEY_MOMENT_PROMPT},
+        {"role": "user", "content": text[:800]}
+    ], max_tokens=40, temp=0.3, user=user)
+    
+    if result and len(result) > 10:
+        moment = result.strip().lower()
+        moment = moment.replace('"', '').replace("«", "").replace("»", "")
+        moment = moment.strip(" .,-\n")
+        if len(moment.split()) > 14:
+            moment = " ".join(moment.split()[:14])
+        return moment
+    
+    t = text.replace("\n", " ")
+    sentences = re.split(r"[.!?…]", t)
+    tension_words = ["не произошло", "не случилось", "не дошло", "не хватило", "хотел", "ждал"]
+    
+    for s in sentences:
+        if any(w in s.lower() for w in tension_words):
+            return s.strip()[:120]
+    
+    return text[:120]
 
-def build_control_keyboard() -> dict:
-    return {"inline_keyboard": [
-        [{"text": "🎮 Контроль", "callback_data": "control:контроль"}],
-        [{"text": "🌊 Потеря контроля", "callback_data": "control:потеря"}],
-        [{"text": "🤷 Не знаю", "callback_data": "control:не знаю"}],
-    ]}
+def identity_hook(moment: str) -> str:
+    hooks = [
+        f"Ты уже не просто наблюдаешь это — ты выбираешь, кем становишься внутри {moment}.",
+        f"После этого выбора ты не сможешь воспринимать опыт так же.",
+        f"Обе версии тебя уже существуют — вопрос в том, какую ты усилишь.",
+        f"Ты не смотришь на опыт. Ты собираешь себя из него.",
+        f"Это не просто интерпретация. Это точка, где ты решаешь, кто ты.",
+    ]
+    return random.choice(hooks)
+
+# ================= IDENTITY REWRITE ENGINE =================
+def build_choice_block(conflict: dict, moment: str) -> str:
+    return (
+        "⚖️ ДВЕ ВЕРСИИ ОДНОГО ОПЫТА\n\n"
+
+        "🔬 А — ТЕЛЕСНАЯ / НЕЙРОФИЗИОЛОГИЧЕСКАЯ:\n"
+        f"{conflict['neuro'][:400]}\n\n"
+
+        "🏺 B — СМЫСЛОВАЯ / АРХЕТИПИЧЕСКАЯ:\n"
+        f"{conflict['jung'][:400]}\n\n"
+
+        "────────────────────\n\n"
+
+        "Выбери, что ближе к тебе прямо сейчас:\n\n"
+
+        "А — это про тело, реакцию, нервную систему\n"
+        "B — это про символ, смысл, внутренний сюжет\n\n"
+
+        "Ты не выбираешь правильное.\n"
+        "Ты выбираешь, кем ты становишься в этом опыте."
+    )
+
+def generate_conflict_views(experience: str, user: dict) -> dict:
+    neuro_view = safe_llm([
+        {"role": "system", "content": NEURO_PROMPT},
+        {"role": "user", "content": experience[:600]}
+    ], max_tokens=400, temp=0.5, user=user) or "Тело здесь реагирует раньше, чем ты это осознаёшь. Напряжение — это сигнал, который не получил разрядки."
+
+    jung_view = safe_llm([
+        {"role": "system", "content": JUNG_PROMPT},
+        {"role": "user", "content": experience[:600]}
+    ], max_tokens=400, temp=0.5, user=user) or "Это похоже на внутренний сюжет, который повторяется. Образы — не случайны, они часть твоего пути."
+
+    return {"neuro": neuro_view, "jung": jung_view}
+
+def build_identity_rewrite(selected: str, experience: str, moment: str, user: dict) -> str:
+    views = user.get("_conflict_views", {})
+
+    if selected == "A":
+        base = views.get("neuro", "Тело здесь — главный проводник опыта.")
+        system = REWRITE_SYSTEM_A
+    else:
+        base = views.get("jung", "Смысл здесь — главный проводник опыта.")
+        system = REWRITE_SYSTEM_B
+
+    result = safe_llm([
+        {"role": "system", "content": system},
+        {"role": "user", "content": experience[:800]}
+    ], max_tokens=300, temp=0.5, user=user)
+
+    if not result:
+        result = "Если смотреть через эту версию, ты действуешь из глубинной реакции, которая уже сложилась внутри тебя."
+
+    user["rewrite_history"].append({
+        "timestamp": time.time(),
+        "choice": selected,
+        "moment": moment,
+        "identity": result[:200]
+    })
+    if len(user["rewrite_history"]) > 20:
+        user["rewrite_history"].pop(0)
+
+    return (
+        "🧬 СБОРКА СМЫСЛА\n\n"
+        f"{base}\n\n"
+        "──────────────\n\n"
+        f"{result}\n\n"
+        "Это не факт о тебе.\n"
+        "Это версия, в которую ты входишь, если смотришь отсюда.\n\n"
+        "Это не истина о тебе.\n"
+        "Это один из способов увидеть себя через этот опыт."
+    )
+
+# ================= CONFLICT MIRROR =================
+def build_conflict_mirror(experience: str, user: dict) -> dict:
+    moment = extract_key_moment(experience, user)
+    user["_conflict_moment"] = moment
+
+    base = safe_llm([
+        {"role": "system", "content": MIRROR_PROMPT_V3},
+        {"role": "user", "content": experience[:EXPERIENCE_SWEET_SPOT]}
+    ], max_tokens=MIRROR_MAX_TOKENS, temp=0.6, user=user) or "Ты описываешь опыт, в котором есть напряжение, но оно не завершилось. Ты ждал разрядки — но что-то её не пустило."
+
+    views = generate_conflict_views(experience, user)
+    user["_conflict_views"] = views
+
+    hook = identity_hook(moment)
+
+    friction = (
+        "Остановись на секунду.\n"
+        "Что из этого ближе не логически, а по ощущению?\n\n"
+    )
+
+    result = (
+        f"{base}\n\n"
+        f"──────────────\n\n"
+        f"{hook}\n\n"
+        f"{friction}"
+        f"{build_choice_block(views, moment)}"
+    )
+
+    return {
+        "text": safe_text(result),
+        "keyboard": build_conflict_keyboard()
+    }
 
 # ================= ROUTING =================
 def route(user: dict, text: str) -> str:
     state = user["state"]
-    
     log(f"Route: state={state} text={text[:50]}")
 
-    if text.startswith("self_inquiry:"): return "self_inquiry_action"
-    if text.startswith("emotion:"): return "emotion"
-    if text.startswith("control:"): return "pattern"
-
-    if text == "/start" or text == "/new": return "start"
-    if text == "/menu": return "show_menu"
-    if text == "/reset": return "reset_state"
-    if text == "/patterns": return "show_patterns"
-
-    lens_cmd = text[1:] if text.startswith("/") else None
-    if lens_cmd and lens_cmd in LENS_LIBRARY:
-        if user.get("last_experience"):
-            return f"lens_{lens_cmd}"
+    if text in ("/start", "/new"):
         return "start"
+    if text in ("/reset", "reset"):
+        return "reset_state"
 
-    if state == STATE_REFLECTION:
-        return "focus"
-    
-    if state == STATE_FOCUS:
-        return "emotion"
-    
-    if state == STATE_EMOTION:
-        return "pattern"
-    
-    if state == STATE_PATTERN:
-        return "mirror_entry"
-    
-    if state == STATE_SELF_INQUIRY:
-        if text.lower() in ["всё", "хватит", "понял", "ясно"]:
-            return "self_inquiry_action"
-        return "self_inquiry_response"
-    
-    if state == STATE_EXPERIENCE_RETURN:
-        if text.startswith("/"):
-            lc = text[1:]
-            if lc in LENS_LIBRARY and user.get("last_experience"):
-                return f"lens_{lc}"
-        return "self_inquiry_response"
-    
-    if state == STATE_DEEP:
-        return "end"
-    
+    if text in ("choice_A", "choice_B"):
+        return text
+
+    if text.startswith("self_inquiry:"):
+        return text
+
+    if state == STATE_IDLE and len(text.strip()) < MIN_EXPERIENCE_LENGTH:
+        return "reject_short"
+
     if state == STATE_IDLE:
-        return "input_experience" if len(text.split()) >= 5 else "short_input"
+        return "mirror_conflict"
 
-    return "start"
+    if state == STATE_CONFLICT:
+        return "mirror_conflict"
+
+    if state == STATE_REWRITE:
+        return "after_rewrite"
+
+    return "mirror_conflict"
 
 # ================= HANDLERS =================
 def handle_start(user: dict) -> dict:
     user.update({
         "state": STATE_IDLE, "last_experience": "", "used_lenses": [],
-        "self_inquiry_depth": 0,
-        "guide_focus": "", "guide_emotion": "", "guide_control": ""
+        "chosen_view": "", "_conflict_views": {}, "_conflict_moment": ""
     })
     save_users_sync()
     
     if user.get("returning_user"):
-        return {
-            "text": (
-                "🌿 С возвращением.\n\n"
-                "Ты можешь описать новый опыт.\n\n"
-                "Или сразу посмотреть прошлый через линзу:\n"
-                "/neuro /jung /cbt /shaman\n\n"
-                "Начни с того, что сейчас важно."
-            )
-        }
+        return {"text": "🌿 С возвращением.\n\nОпиши новый опыт."}
     
     return {
         "text": (
             "🌿 Я — проводник осознания.\n\n"
-            "Ты описываешь опыт — я помогаю понять, что с тобой происходило.\n\n"
-            "Опиши любой недавний опыт:\n"
-            "— ситуация\n"
-            "— ощущение в теле\n"
-            "— что тебя зацепило"
+            "Опиши, что ты пережил.\n"
+            "Я покажу тебе это с разных сторон — и ты сам решишь, кто ты в этом."
         )
     }
 
-def handle_experience_input(user: dict, text: str) -> dict:
-    user["last_experience"] = text[:MAX_INPUT_LENGTH]
-    result = call_llm_sync([
-        {"role": "system", "content": GUIDE_REFLECTION_PROMPT},
-        {"role": "user", "content": text[:MAX_INPUT_LENGTH]}
-    ], max_tokens=300, user=user)
-    user["state"] = STATE_REFLECTION
-    save_users_sync()
-    return {"text": result}
-
-def handle_focus(user: dict, text: str) -> dict:
-    user["guide_focus"] = text
-    user["state"] = STATE_FOCUS
-    save_users_sync()
-    return {"text": "🪨 Ты выбрал это место.\n\nКакое чувство здесь было сильнее всего?", "keyboard": build_emotion_keyboard()}
-
-def handle_emotion(user: dict, text: str) -> dict:
-    clean = text.replace("emotion:", "") if text.startswith("emotion:") else text
-    user["guide_emotion"] = clean
-    user["state"] = STATE_EMOTION
-    save_users_sync()
-    return {"text": "🌬️ Это больше про контроль или про отпускание?", "keyboard": build_control_keyboard()}
-
-def handle_pattern(user: dict, text: str) -> dict:
-    clean = text.replace("control:", "") if text.startswith("control:") else text
-    user["guide_control"] = clean
-    result = call_llm_sync([
-        {"role": "system", "content": GUIDE_PATTERN_PROMPT},
-        {"role": "user", "content": user["last_experience"][:500]}
-    ], max_tokens=300, user=user)
-    
-    pattern_line = (result or "").strip().split("\n")[0]
-    if not pattern_line or len(pattern_line) < 3:
-        pattern_line = "неоформленный опыт"
-    
-    patterns = user.setdefault("collected_patterns", [])
-    patterns.append(pattern_line)
-    if len(patterns) > 50:
-        patterns.pop(0)
-    
-    user["state"] = STATE_SELF_INQUIRY
-    user["returning_user"] = True
-    user["self_inquiry_depth"] = 0
-    
-    mirror_text = build_mirror(user, pattern_line)
-    
-    save_users_sync()
-    
+def handle_reject_short() -> dict:
     return {
-        "text": (
-            f"🧭 Паттерн:\n\n{pattern_line}\n\n"
-            f"────────────────────\n{mirror_text}"
-        )
+        "text": "Опиши чуть подробнее, чтобы можно было увидеть структуру опыта.\n\nЧто ты чувствовал? Что происходило в теле?"
     }
 
-def build_mirror(user: dict, pattern: str) -> str:
-    experience = user.get("last_experience", "")[:EXPERIENCE_SWEET_SPOT]
-    result = call_llm_sync([
-        {"role": "system", "content": MIRROR_PROMPT_V2},
-        {"role": "user", "content": f"Паттерн: {pattern}\n\nОпыт:\n{experience}"}
-    ], max_tokens=MIRROR_MAX_TOKENS, user=user)
+def handle_mirror_conflict(user: dict, text: str) -> dict:
+    user["last_experience"] = text[:MAX_INPUT_LENGTH]
+    user["state"] = STATE_CONFLICT
+    user["returning_user"] = True
     
-    if len(result) > MIRROR_MAX_CHARS:
-        result = result[:MIRROR_MAX_CHARS].rsplit(".", 1)[0] + "."
-    if len(result) < 200:
-        result += "\n\nПопробуй ещё раз описать, что именно ты почувствовал."
+    result = build_conflict_mirror(text, user)
+    
+    save_users_sync()
     
     return result
 
-def handle_self_inquiry_response(user: dict, text: str) -> dict:
-    user["self_inquiry_depth"] = user.get("self_inquiry_depth", 0) + 1
-    
-    if user["self_inquiry_depth"] > MAX_SELF_INQUIRY_DEPTH:
-        user["state"] = STATE_IDLE
-        user.update({"guide_focus": "", "guide_emotion": "", "guide_control": "", "self_inquiry_depth": 0})
-        save_users_sync()
-        return {"text": "🌿 Достаточно. Попробуй понаблюдать это в жизни."}
-    
-    if "?" in text and len(text.split()) < 10:
-        return {
-            "text": "Я говорил про ощущения в твоём опыте.\n\nЧто из этого откликается тебе сейчас сильнее?",
-            "keyboard": build_post_analysis_keyboard()
-        }
-    
-    v = user.get("user_vector", {})
-    mode = "reflect"
-    if v.get("resistance", 0) >= 6: mode = "soften"
-    elif v.get("depth", 0) < 3: mode = "deepen"
-    elif v.get("clarity", 0) < 4: mode = "clarify"
-    
-    prompts = {
-        "deepen": "Задай один вопрос глубже в чувство.",
-        "clarify": "Помоги сформулировать точнее. 1 отражение + 1 уточняющий вопрос.",
-        "reflect": "1 отражение + 1 мягкий вопрос.",
-        "soften": "Человек сопротивляется. Мягкий, безопасный вопрос.",
-        "silence": "Ничего не спрашивай. 1 фраза фиксации.",
+def handle_choice(user: dict, choice: str) -> dict:
+    view = "A" if choice == "choice_A" else "B"
+    user["chosen_view"] = view
+
+    user["identity_story"].append({
+        "timestamp": time.time(),
+        "choice": view,
+        "moment": user.get("_conflict_moment", "")
+    })
+    if len(user["identity_story"]) > 30:
+        user["identity_story"].pop(0)
+
+    save_users_sync()
+
+    return handle_do_rewrite(user)
+
+def handle_do_rewrite(user: dict) -> dict:
+    user["state"] = STATE_REWRITE
+
+    text = build_identity_rewrite(
+        user.get("chosen_view", "A"),
+        user.get("last_experience", ""),
+        user.get("_conflict_moment", ""),
+        user
+    )
+
+    save_users_sync()
+
+    return {
+        "text": safe_text(text),
+        "keyboard": build_rewrite_keyboard()
     }
-    
-    result = call_llm_sync([
-        {"role": "system", "content": prompts[mode]},
-        {"role": "user", "content": text[:500]}
-    ], max_tokens=200, user=user)
-    
-    if mode == "silence":
-        return {"text": result}
-    return {"text": result, "keyboard": build_post_analysis_keyboard()}
 
-def handle_self_inquiry_action(user: dict, text: str) -> dict | None:
-    sub = text.split(":", 1)[1] if ":" in text else text
-    if sub in ["всё", "хватит", "понял", "ясно"]:
-        sub = "end"
+def handle_after_rewrite(user: dict) -> dict:
+    identity_count = len(user.get("identity_story", []))
     
-    if sub == "deep":
-        user["state"] = STATE_DEEP
-        result = call_llm_sync([
-            {"role": "system", "content": GUIDE_DEEP_PROMPT},
-            {"role": "user", "content": user["last_experience"][:500]}
-        ], max_tokens=150, user=user)
-        save_users_sync()
-        return {"text": result}
-    elif sub == "lens":
-        user["state"] = STATE_IDLE
-        return {"text": "Хорошо. Давай посмотрим на этот же опыт с другой стороны.\n\nВыбери линзу:", "keyboard": build_menu_keyboard()}
-    elif sub == "end":
-        user["state"] = STATE_IDLE
-        user.update({"guide_focus": "", "guide_emotion": "", "guide_control": "", "self_inquiry_depth": 0})
-        save_users_sync()
-        return {"text": "🌿 Принято. Ты можешь понаблюдать это в жизни или принести новый опыт."}
-    return None
-
-def handle_lens(user: dict, lens_key: str) -> dict:
-    if not user.get("last_experience"):
-        return {"text": "Сначала нужен опыт.\n\nОпиши, что ты пережил — и я разберу это через выбранную линзу."}
-    
-    lens = LENS_LIBRARY[lens_key]
-    if lens.get("static_text"):
-        result = lens["static_text"]
-    else:
-        result = call_llm_sync([
-            {"role": "system", "content": lens["prompt"]},
-            {"role": "user", "content": user["last_experience"]}
-        ], user=user)
-    
-    lst = user.setdefault("used_lenses", [])
-    lst.append(lens_key)
-    if len(lst) > 50:
-        lst.pop(0)
     user["state"] = STATE_IDLE
     save_users_sync()
     
-    return {"text": f"Смотрю через «{lens['name']}».\n\n{result}\n\nЧто ты возьмёшь из этого в следующий раз?"}
-
-def add_experience_return_block() -> dict:
     return {
         "text": (
-            "🌿 Теперь самое важное:\n\n"
-            "Эти образы — сугубо индивидуальны. Только ты знаешь, что они значат для тебя.\n"
-            "Все интерпретации — лишь зеркало. Что-то откликнется, что-то нет.\n\n"
-            "Если хочешь — можем разобрать глубже или посмотреть через другую линзу."
+            f"🌿 Цикл завершён.\n\n"
+            f"Ты прошёл путь от опыта — к выбору — к новой сборке себя.\n\n"
+            f"За всё время ты сделал {identity_count} выборов того, кто ты.\n\n"
+            f"Ты можешь начать с новым опытом или побыть с тем, что сейчас."
         ),
-        "keyboard": build_post_analysis_keyboard()
+        "keyboard": build_rewrite_keyboard()
     }
+
+def handle_deep(user: dict) -> dict:
+    user["state"] = STATE_DEEP
+    
+    result = safe_llm([
+        {"role": "system", "content": "Задай один глубокий вопрос о том, кем человек становится через этот опыт."},
+        {"role": "user", "content": user["last_experience"][:500]}
+    ], max_tokens=150, temp=0.6, user=user) or "Что в этом опыте всё ещё остаётся незавершённым?"
+    
+    return {"text": result}
+
+def handle_end(user: dict) -> dict:
+    user["state"] = STATE_IDLE
+    user["chosen_view"] = ""
+    save_users_sync()
+    return {"text": "🌿 Принято. Ты можешь вернуться к этому опыту в любое время."}
 
 # ================= EXECUTE =================
 def execute(uid: int, action: str, text: str) -> dict | None:
     user = get_user(uid)
-    log(f"Execute: uid={uid} action={action} text={text[:50]} state={user['state']}")
+    log(f"Execute: uid={uid} action={action} state={user['state']}")
     
     if action == "start": return handle_start(user)
     if action == "reset_state":
         user.update({
-            "state": STATE_IDLE, "last_experience": "",
-            "used_lenses": [], "self_inquiry_depth": 0,
-            "guide_focus": "", "guide_emotion": "", "guide_control": ""
+            "state": STATE_IDLE, "last_experience": "", "used_lenses": [],
+            "chosen_view": "", "_conflict_views": {}, "_conflict_moment": ""
         })
         save_users_sync()
-        return {"text": "🔄 Пространство очищено."}
-    if action == "show_menu": return {"text": "🎯 Выбери линзу:", "keyboard": build_menu_keyboard()}
-    if action == "show_patterns":
-        patterns = user.get("collected_patterns", [])
-        if not patterns: return {"text": "Узоры ещё не проявились."}
-        return {"text": "🕸️ Твои узоры:\n\n" + "\n\n".join(f"{i+1}. {p}" for i, p in enumerate(patterns[-10:]))}
+        return {"text": "🔄 Пространство очищено. Опиши новый опыт."}
     
-    if action == "input_experience": return handle_experience_input(user, text)
-    if action == "short_input":
-        user["last_experience"] = text
-        user["state"] = STATE_REFLECTION
-        result = call_llm_sync([
-            {"role": "system", "content": GUIDE_REFLECTION_PROMPT},
-            {"role": "user", "content": text}
-        ], max_tokens=300, user=user)
-        return {"text": result}
+    if action == "reject_short": return handle_reject_short()
+    if action == "mirror_conflict": return handle_mirror_conflict(user, text)
     
-    if action == "focus": return handle_focus(user, text)
-    if action == "emotion": return handle_emotion(user, text)
-    if action == "pattern":
-        response = handle_pattern(user, text)
-        return response
-    if action == "mirror_entry":
-        user["state"] = STATE_SELF_INQUIRY
-        patterns = user.get("user_world", {}).get("patterns", [])
-        last_pattern = patterns[-1] if patterns else "неоформленный опыт"
-        mirror_text = build_mirror(user, last_pattern)
-        save_users_sync()
-        return {"text": f"🧠 Интерпретация:\n{mirror_text}"}
+    if action == "choice_A": return handle_choice(user, "choice_A")
+    if action == "choice_B": return handle_choice(user, "choice_B")
     
-    if action == "self_inquiry_response": return handle_self_inquiry_response(user, text)
-    if action == "self_inquiry_action": return handle_self_inquiry_action(user, text)
-    if action == "end":
-        user["state"] = STATE_IDLE
-        user.update({"guide_focus": "", "guide_emotion": "", "guide_control": "", "self_inquiry_depth": 0})
-        save_users_sync()
-        return {"text": "Ты можешь понаблюдать это в жизни или принести новый опыт. Я здесь."}
+    if action == "after_rewrite": return handle_after_rewrite(user)
     
-    if action.startswith("lens_"): return handle_lens(user, action.replace("lens_", ""))
+    if action.startswith("self_inquiry:"):
+        sub = action.split(":", 1)[1]
+        if sub == "deep":
+            return handle_deep(user)
+        elif sub == "end":
+            return handle_end(user)
+    
+    if action == "end": return handle_end(user)
     
     return None
 
-# ================= PROCESS MESSAGE =================
+# ================= PROCESS =================
 def process_message(chat_id: int, text: str) -> None:
     user = get_user(chat_id)
-    
+
     if not text:
         return
-    
+
     text = text.strip()
+
+    # 🔒 Защита от дубликатов
+    if is_duplicate(user, text):
+        log(f"Duplicate skipped: {chat_id}")
+        return
+
+    # 🔒 Rate limit
+    if is_rate_limited(user):
+        log(f"Rate limited: {chat_id}")
+        return
+
     action = route(user, text)
+
+    log(f"[FLOW] uid={chat_id} state={user['state']} action={action}")
+
+    # 💭 UX: thinking indicator перед LLM-операциями
+    if action in ("mirror_conflict", "choice_A", "choice_B", "do_rewrite"):
+        send_thinking(chat_id)
+
     response = execute(chat_id, action, text)
-    
+
     if response:
         send_message(chat_id, response.get("text", ""), response.get("keyboard"))
-    
-    # 🔥 ГАРАНТИРОВАННАЯ отправка меню после pattern
-    if action == "pattern":
-        user["state"] = STATE_EXPERIENCE_RETURN
-        save_users_sync()
-        time.sleep(0.5)
-        return_block = add_experience_return_block()
-        send_message(chat_id, return_block["text"], return_block["keyboard"])
-    
-    # 🔥 ГАРАНТИРОВАННАЯ отправка меню после mirror_entry
-    if action == "mirror_entry":
-        user["state"] = STATE_EXPERIENCE_RETURN
-        save_users_sync()
-        time.sleep(0.5)
-        return_block = add_experience_return_block()
-        send_message(chat_id, return_block["text"], return_block["keyboard"])
 
 def process_callback(chat_id: int, data: str) -> None:
     user = get_user(chat_id)
-    
+
     if not data:
         return
-    
+
+    # 🔒 Rate limit для callback'ов тоже
+    if is_rate_limited(user):
+        return
+
     action = route(user, data)
+
+    log(f"[CALLBACK] uid={chat_id} action={action}")
+
+    send_thinking(chat_id)
+
     response = execute(chat_id, action, data)
-    
+
     if response:
         send_message(chat_id, response.get("text", ""), response.get("keyboard"))
 
-# ================= WEBHOOK HANDLER =================
+# ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/10.1-MIRROR"
+    server_version = "ShamanBot/11.4.2"
     
     def _send_json(self, code: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -644,6 +616,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "ok": True,
                 "service": "shaman-bot",
+                "version": "11.4.2",
                 "users": len(users)
             })
             return
@@ -657,7 +630,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if WEBHOOK_SECRET:
             incoming = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if incoming != WEBHOOK_SECRET:
-                log("Rejected: invalid secret")
                 self._send_json(403, {"ok": False, "error": "Invalid webhook secret"})
                 return
         
@@ -665,42 +637,37 @@ class WebhookHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         body = raw.decode("utf-8", errors="replace")
         
-        log(f"Webhook: {len(raw)} bytes")
-        log(f"Payload: {body[:300]}")
-        
+        # 🔒 Защита от падений в webhook
         try:
             update = json.loads(body) if body else {}
         except json.JSONDecodeError:
             self._send_json(400, {"ok": False, "error": "Invalid JSON"})
             return
         
-        callback = update.get("callback_query")
-        if callback:
-            cid = callback.get("id", "")
-            msg = callback.get("message", {})
-            chat_id = msg.get("chat", {}).get("id")
-            data = callback.get("data", "")
+        try:
+            callback = update.get("callback_query")
+            if callback:
+                cid = callback.get("id", "")
+                msg = callback.get("message", {})
+                chat_id = msg.get("chat", {}).get("id")
+                data = callback.get("data", "")
+                
+                answer_callback(cid)
+                if chat_id and data:
+                    process_callback(chat_id, data)
+                
+                self._send_json(200, {"ok": True})
+                return
             
-            log(f"Callback: chat={chat_id} data={data}")
+            message = update.get("message") or update.get("edited_message") or {}
+            chat_id = message.get("chat", {}).get("id")
+            text = message.get("text") or message.get("caption") or ""
             
-            answer_callback(cid)
-            if chat_id and data:
-                process_callback(chat_id, data)
+            if chat_id and text:
+                process_message(chat_id, text)
             
-            self._send_json(200, {"ok": True})
-            return
-        
-        message = update.get("message") or update.get("edited_message") or {}
-        chat = message.get("chat", {})
-        chat_id = chat.get("id")
-        text = message.get("text") or message.get("caption") or ""
-        
-        log(f"Message: chat={chat_id} text={text[:100] if text else '(empty)'}")
-        
-        if chat_id and text:
-            process_message(chat_id, text)
-        elif chat_id:
-            log(f"No text in message. Keys: {list(message.keys())}")
+        except Exception as e:
+            log(f"FATAL: {traceback.format_exc()}")
         
         self._send_json(200, {"ok": True})
     
@@ -731,7 +698,7 @@ def main() -> int:
         log("WARNING: BOT_TOKEN empty")
     
     server = HTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v10.1-MIRROR on {HOST}:{PORT}")
+    log(f"ShamanBot v11.4.2 on {HOST}:{PORT}")
     
     try:
         server.serve_forever()
