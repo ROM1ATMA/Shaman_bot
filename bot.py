@@ -24,8 +24,9 @@ if not BOT_TOKEN: raise RuntimeError("❌ BOT_TOKEN empty")
 
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 MAX_INPUT_LENGTH = 4000
-UNIFIED_MAX_TOKENS = 1000
-LENS_MAX_TOKENS = 800          # Увеличено для полных промптов
+UNIFIED_MAX_TOKENS = 1200          # Увеличено для более глубокого разбора
+LENS_MAX_TOKENS = 1500            # Увеличено — полные промпты требуют пространства
+PNI_MAX_TOKENS = 800              # Увеличено с 600
 MAX_TELEGRAM_CHARS = 4096
 EXPERIENCE_SWEET_SPOT = 1200
 MIN_EXPERIENCE_LENGTH = 15
@@ -321,7 +322,7 @@ DEEP_PATTERNS = [
     "Какую часть себя ты узнаёшь в этом опыте?",
 ]
 
-# ================= LENS LIBRARY (v12.4: full prompts) =================
+# ================= LENS LIBRARY =================
 LENS_LIBRARY = {
     "neuro": {
         "name": "Нейрофизиология",
@@ -669,7 +670,7 @@ def handle_pni(user: dict, uid: int) -> dict:
     result = safe_llm([
         {"role": "system", "content": PNI_DEEP_PROMPT},
         {"role": "user", "content": user["last_experience"][:1000]}
-    ], max_tokens=600, temp=0.5) or (
+    ], max_tokens=PNI_MAX_TOKENS, temp=0.5) or (
         "Нервная система (симпатическая) активирует кортизол и адреналин. "
         "Это влияет на иммунные клетки (цитокины). После разрешения — фаза восстановления. "
         "Усталость или очищение — не сбой, а цикл: стресс → адаптация → обновление."
@@ -787,7 +788,7 @@ def process_callback(chat_id: int, data: str) -> None:
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/12.4"
+    server_version = "ShamanBot/12.5"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -796,7 +797,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "12.4", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "12.5", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -853,7 +854,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v12.4 FULL-PROMPTS on {HOST}:{PORT}")
+    log(f"ShamanBot v12.5 INCREASED-TOKENS on {HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
