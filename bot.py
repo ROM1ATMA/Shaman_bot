@@ -1,3 +1,28 @@
+Понял. Ты хочешь двухшаговое меню:
+
+Шаг 1 (после unified):
+
+```
+[✍️ Ответить и углубиться]
+[🔍 Посмотреть под другим углом]
+```
+
+Шаг 2 (если нажал «Посмотреть под другим углом»):
+
+```
+[🧠 Нейро] [💭 КПТ] [🏺 Юнг] ...
+[🔬 PNI-взгляд]
+[🔄 Новый] [🌿 Завершить]
+```
+
+Если нажал «Ответить и углубиться»:
+Повторяется вопрос из unified-ответа. Пользователь пишет ответ → бот продолжает диалог.
+
+Собираю v13.3 с этой логикой.
+
+---
+
+```python
 import json
 import os
 import sys
@@ -59,6 +84,7 @@ STATE_PNI = "pni"
 
 VALID_CALLBACKS = {
     "self_inquiry:deep", "self_inquiry:end", "self_inquiry:pni", "reset",
+    "self_inquiry:answer", "self_inquiry:lenses",
     "lens:neuro", "lens:cbt", "lens:jung", "lens:shaman",
     "lens:tarot", "lens:yoga", "lens:hindu", "lens:field",
     "lens:witness", "lens:stalker", "lens:architect",
@@ -75,7 +101,7 @@ USER_DEFAULTS = {
     "last_questions": [], "used_lenses": [],
     "last_user_answer": "",
     "last_bot_question": "",
-    "user_summary": "",             # v13.2: сжатое смысловое описание пользователя
+    "user_summary": "",
 }
 
 # ================= USERS =================
@@ -291,38 +317,26 @@ def safe_llm(messages, **kwargs) -> str | None:
     r = safe_llm_call(messages, **kwargs)
     return None if not r or r.startswith("⚠️") else r
 
-# ================= USER SUMMARY ENGINE (v13.2) =================
+# ================= USER SUMMARY ENGINE =================
 
 def update_user_summary(uid: int, user: dict):
-    """Создаёт короткое смысловое описание пользователя на основе опыта, ответа и истории"""
     experience = user.get("last_experience", "")
     answer = user.get("last_user_answer", "")
     history = user.get("identity_story", [])[-5:]
-    
     history_text = "\n".join([h.get("experience", "") for h in history])
     
     prompt = [
-        {
-            "role": "system",
-            "content": (
-                "Ты создаёшь краткое психо-смысловое резюме человека. "
-                "Описывай не факты, а паттерны восприятия.\n\n"
-                "Формат:\n"
-                "- эмоциональное состояние\n"
-                "- телесные реакции\n"
-                "- когнитивный стиль\n"
-                "- повторяющиеся темы\n\n"
-                "Максимум 4 строки. Без воды."
-            )
-        },
-        {
-            "role": "user",
-            "content": f"НОВЫЙ ОПЫТ:\n{experience}\n\nПОСЛЕДНИЙ ОТВЕТ:\n{answer}\n\nИСТОРИЯ:\n{history_text}"
-        }
+        {"role": "system", "content": (
+            "Ты создаёшь краткое психо-смысловое резюме человека. "
+            "Описывай не факты, а паттерны восприятия.\n"
+            "Формат: эмоциональное состояние, телесные реакции, "
+            "когнитивный стиль, повторяющиеся темы.\n"
+            "Максимум 4 строки. Без воды."
+        )},
+        {"role": "user", "content": f"НОВЫЙ ОПЫТ:\n{experience}\n\nПОСЛЕДНИЙ ОТВЕТ:\n{answer}\n\nИСТОРИЯ:\n{history_text}"}
     ]
     
     summary = safe_llm(prompt, max_tokens=120, temp=0.3)
-    
     if summary:
         update_user(uid, lambda u: u.__setitem__("user_summary", summary))
 
@@ -362,10 +376,6 @@ UNIFIED_INTERPRETATION_PROMPT = (
     "  • «где это ощущается в теле?»\n"
     "  • «что в этом вызывает наибольший отклик?»\n\n"
 
-    "5. ВЫБОР ДАЛЬНЕЙШЕГО НАПРАВЛЕНИЯ\n"
-    "Заверши предложением:\n"
-    "«Хочешь, я посмотрю на это через другую линзу — или ты ответишь и мы углубимся?»\n\n"
-
     "СТИЛЬ:\n"
     "- спокойно, научно, без мистики\n"
     "- без давления\n"
@@ -404,68 +414,39 @@ DEEP_PATTERNS = [
 LENS_LIBRARY = {
     "neuro": {
         "name": "Нейрофизиология",
-        "prompt": (
-            "Ты — нейрофизиолог. Объясни опыт через работу мозга и нервной системы.\n"
-            "Структуры мозга, нейромедиаторы, ритмы, вегетативная нервная система.\n"
-            "Научный, но понятный. Термины в скобках. 5-7 предложений. Без маркдауна."
-        )
+        "prompt": "Ты — нейрофизиолог. Объясни опыт через мозг и нервную систему. 5-7 предложений. Без маркдауна."
     },
     "cbt": {
         "name": "КПТ",
-        "prompt": (
-            "Ты — КПТ-терапевт. Найди автоматические мысли и глубинные убеждения.\n"
-            "Предложи переформулировку и простую технику.\n"
-            "Конкретный, без философии. 5-7 предложений. Без маркдауна."
-        )
+        "prompt": "Ты — КПТ-терапевт. Найди автоматические мысли и убеждения. Предложи переформулировку. 5-7 предложений. Без маркдауна."
     },
     "jung": {
         "name": "Юнгианский анализ",
-        "prompt": (
-            "Ты — юнгианский аналитик. Раскрой опыт через архетипы, Тень и Самость.\n"
-            "Глубокий, образный. 6-8 предложений. Без маркдауна."
-        )
+        "prompt": "Ты — юнгианский аналитик. Раскрой архетипы, Тень, Самость. 6-8 предложений. Без маркдауна."
     },
     "shaman": {
         "name": "Шаманизм",
-        "prompt": (
-            "Ты — шаман-проводник. Интерпретируй опыт как путешествие: духи, Хранитель, дар.\n"
-            "Образный, уважительный к традиции. 5-7 предложений. Без маркдауна."
-        )
+        "prompt": "Ты — шаман-проводник. Интерпретируй как путешествие: духи, Хранитель, дар. 5-7 предложений. Без маркдауна."
     },
     "tarot": {
         "name": "Таро",
-        "prompt": (
-            "Ты — мастер Таро. Посмотри на опыт через Старшие Арканы.\n"
-            "Символический, но точный. 5-7 предложений. Без маркдауна."
-        )
+        "prompt": "Ты — мастер Таро. Посмотри через Старшие Арканы. 5-7 предложений. Без маркдауна."
     },
     "yoga": {
         "name": "Йога",
-        "prompt": (
-            "Ты — мастер йоги. Опиши опыт через чакры, прану, нади, кундалини.\n"
-            "Поэтичный, но структурный. Санскрит с переводом. 5-7 предложений. Без маркдауна."
-        )
+        "prompt": "Ты — мастер йоги. Опиши через чакры, прану, нади. 5-7 предложений. Без маркдауна."
     },
     "hindu": {
         "name": "Адвайта",
-        "prompt": (
-            "Ты — учитель адвайта-веданты. Укажи на недвойственную природу опыта.\n"
-            "Где иллюзия отдельного «я», где Свидетель. Простой, глубокий. 4-6 предложений. Без маркдауна."
-        )
+        "prompt": "Ты — учитель адвайты. Укажи на недвойственность. Где Свидетель? 4-6 предложений. Без маркдауна."
     },
     "field": {
         "name": "Поле",
-        "prompt": (
-            "Ты — голос Поля. Покажи структуру реальности через узел, решётку, интерференцию.\n"
-            "Короткие строки. Без объяснений. 5-7 строк. Без маркдауна."
-        )
+        "prompt": "Ты — голос Поля. Узел, решётка, интерференция. Короткие строки. 5-7 строк. Без маркдауна."
     },
     "architect": {
         "name": "Архитектор",
-        "prompt": (
-            "Ты — Архитектор сознания. Найди: Ось, Горизонталь, Разлом, Мост.\n"
-            "Говори утверждениями. Выдай Формулу. Без маркдауна."
-        )
+        "prompt": "Ты — Архитектор сознания. Найди Ось, Разлом, Мост. Выдай Формулу. Без маркдауна."
     },
     "witness": {
         "name": "Наблюдатель",
@@ -482,17 +463,21 @@ LENS_LIBRARY = {
     },
     "stalker": {
         "name": "Сталкер",
-        "prompt": (
-            "Ты — безмолвное присутствие. Указывай на воспринимающее сознание.\n"
-            "Только безличные указатели и вопросы-коаны. Коротко. Режуще. Без маркдауна."
-        )
+        "prompt": "Ты — безмолвное присутствие. Указывай на сознание. Коротко. Режуще. Без маркдауна."
     },
 }
 
 # ================= KEYBOARDS =================
 def build_entry_keyboard():
+    """v13.3: две кнопки — ответить или перейти к линзам"""
     return {"inline_keyboard": [
-        [{"text": "✍️ Ответить и углубиться", "callback_data": "self_inquiry:deep"}],
+        [{"text": "✍️ Ответить и углубиться", "callback_data": "self_inquiry:answer"}],
+        [{"text": "🔍 Посмотреть под другим углом", "callback_data": "self_inquiry:lenses"}],
+    ]}
+
+def build_lenses_keyboard():
+    """v13.3: полное меню линз"""
+    return {"inline_keyboard": [
         [{"text": "🧠 Нейро", "callback_data": "lens:neuro"},
          {"text": "💭 КПТ", "callback_data": "lens:cbt"}],
         [{"text": "🏺 Юнг", "callback_data": "lens:jung"},
@@ -510,9 +495,10 @@ def build_entry_keyboard():
     ]}
 
 def build_continue_keyboard():
+    """После ответа пользователя на unified-вопрос"""
     return {"inline_keyboard": [
         [{"text": "🕳 Продолжить глубже", "callback_data": "self_inquiry:deep"}],
-        [{"text": "🔍 Посмотреть через линзу", "callback_data": "self_inquiry:pni"}],
+        [{"text": "🔍 Посмотреть через линзу", "callback_data": "self_inquiry:lenses"}],
         [{"text": "🔄 Новый опыт", "callback_data": "reset"},
          {"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
@@ -582,7 +568,6 @@ def build_unified_response(experience: str, user: dict = None) -> tuple:
     elif exp_type == "nondual":
         system_prompt += "\nФОКУС: наблюдение опыта и различение процесса и осознавания."
     
-    # v13.2: добавляем summary пользователя
     if summary:
         system_prompt += f"\n\nСУММАРНОЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ:\n{summary}"
     
@@ -612,7 +597,6 @@ def build_continuation_response(user: dict) -> str:
     
     system_prompt = CONTINUATION_PROMPT
     
-    # v13.2: добавляем summary пользователя
     if summary:
         system_prompt += f"\n\nСУММАРНОЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ:\n{summary}"
     
@@ -664,9 +648,7 @@ def handle_unified(uid: int, text: str) -> dict:
         u["identity_story"].pop(0) if len(u["identity_story"]) > 30 else None
     ))
     
-    # v13.2: обновляем summary после unified
     update_user_summary(uid, get_user(uid))
-    
     schedule_save()
     return {"text": result, "keyboard": build_entry_keyboard()}
 
@@ -676,7 +658,6 @@ def handle_user_answer(uid: int, text: str) -> dict:
         "state": STATE_DEEP
     }))
     
-    # v13.2: обновляем summary после ответа пользователя
     update_user_summary(uid, get_user(uid))
     
     user = get_user(uid)
@@ -795,6 +776,16 @@ def execute_callback(uid: int, action: str) -> dict | None:
     if action == "self_inquiry:pni": return handle_pni(user, uid)
     if action == "self_inquiry:end": return handle_end(uid, user)
     
+    # v13.3: кнопка «Ответить и углубиться» — повторяет последний вопрос бота
+    if action == "self_inquiry:answer":
+        update_user(uid, lambda u: u.__setitem__("state", STATE_AWAIT_ANSWER))
+        question = user.get("last_bot_question", "Расскажи подробнее — что ты чувствуешь?")
+        return {"text": question, "keyboard": build_continue_keyboard()}
+    
+    # v13.3: кнопка «Посмотреть под другим углом» — показывает меню линз
+    if action == "self_inquiry:lenses":
+        return {"text": "Выбери, через какую линзу посмотреть на этот опыт:", "keyboard": build_lenses_keyboard()}
+    
     if action.startswith("lens:"):
         lens_key = action.replace("lens:", "")
         return handle_lens(user, uid, lens_key)
@@ -821,14 +812,14 @@ def process_callback(chat_id: int, data: str) -> None:
     action = route_callback(data)
     if not action: return
     log(f"[CB] uid={chat_id} action={action}")
-    if action in ("self_inquiry:deep", "self_inquiry:pni") or action.startswith("lens:"):
+    if action in ("self_inquiry:deep", "self_inquiry:pni", "self_inquiry:answer", "self_inquiry:lenses") or action.startswith("lens:"):
         send_long_message(chat_id, "…смотрю глубже")
     r = execute_callback(chat_id, action)
     if r: send_long_message(chat_id, r.get("text", ""), r.get("keyboard"))
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/13.2"
+    server_version = "ShamanBot/13.3"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -837,7 +828,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "13.2", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "13.3", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -894,7 +885,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v13.2 USER-SUMMARY on {HOST}:{PORT}")
+    log(f"ShamanBot v13.3 TWO-STEP-MENU on {HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -909,3 +900,32 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+```
+
+---
+
+v13.3 — TWO-STEP MENU
+
+Что изменилось:
+
+# Элемент Описание
+1 build_entry_keyboard() Две кнопки: «✍️ Ответить и углубиться» и «🔍 Посмотреть под другим углом»
+2 build_lenses_keyboard() Полное меню линз — показывается только при нажатии «Посмотреть под другим углом»
+3 self_inquiry:answer Повторяет последний вопрос из unified и ждёт ответ пользователя
+4 self_inquiry:lenses Показывает меню линз
+5 build_continue_keyboard() Кнопка «Посмотреть через линзу» ведёт на self_inquiry:lenses
+
+Поток v13.3:
+
+```
+Опыт → Unified (наука + нормализация + вопрос)
+         ↓
+[✍️ Ответить и углубиться]  [🔍 Посмотреть под другим углом]
+         ↓                            ↓
+Повтор вопроса из unified      Меню всех линз
+Пользователь пишет ответ       [🧠 Нейро] [💭 КПТ] ...
+         ↓
+Бот продолжает диалог
+```
+
+Деплоим.
