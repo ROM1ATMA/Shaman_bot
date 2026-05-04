@@ -24,9 +24,9 @@ if not BOT_TOKEN: raise RuntimeError("❌ BOT_TOKEN empty")
 
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 MAX_INPUT_LENGTH = 4000
-UNIFIED_MAX_TOKENS = 1200          # Увеличено для более глубокого разбора
-LENS_MAX_TOKENS = 1500            # Увеличено — полные промпты требуют пространства
-PNI_MAX_TOKENS = 800              # Увеличено с 600
+UNIFIED_MAX_TOKENS = 1200
+LENS_MAX_TOKENS = 1500
+PNI_MAX_TOKENS = 800
 MAX_TELEGRAM_CHARS = 4096
 EXPERIENCE_SWEET_SPOT = 1200
 MIN_EXPERIENCE_LENGTH = 15
@@ -53,6 +53,7 @@ def log(message: str) -> None:
 
 # ================= STATE MACHINE =================
 STATE_IDLE = "idle"
+STATE_AWAIT_ANSWER = "await_answer"
 STATE_DEEP = "deep"
 STATE_PNI = "pni"
 
@@ -72,6 +73,9 @@ USER_DEFAULTS = {
     "identity_story": [], "deep_count": 0,
     "last_request_time": 0, "last_update_hash": "", "last_update_time": 0,
     "last_questions": [], "used_lenses": [],
+    "last_user_answer": "",
+    "last_bot_question": "",
+    "user_summary": "",             # v13.2: сжатое смысловое описание пользователя
 }
 
 # ================= USERS =================
@@ -86,7 +90,7 @@ def load_users():
                     for uid, data in loaded_data.items():
                         u = dict(USER_DEFAULTS)
                         u.update({k: v for k, v in data.items() if k in USER_DEFAULTS})
-                        if u["state"] not in (STATE_IDLE, STATE_DEEP, STATE_PNI):
+                        if u["state"] not in (STATE_IDLE, STATE_DEEP, STATE_PNI, STATE_AWAIT_ANSWER):
                             u["state"] = STATE_IDLE
                         users[int(uid)] = u
                 log(f"Loaded {len(users)} users from {path}")
@@ -217,6 +221,15 @@ def ensure_complete_sentence(text: str) -> str:
             return text[:pos + 1]
     return text + "…"
 
+def extract_last_question(text: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    questions = [s.strip() for s in sentences if "?" in s]
+    if questions:
+        return questions[-1]
+    if sentences:
+        return sentences[-1].strip()
+    return text[-200:]
+
 # ================= TELEGRAM API =================
 def send_long_message(chat_id: int, text: str, keyboard: dict = None) -> bool:
     if not text:
@@ -278,40 +291,105 @@ def safe_llm(messages, **kwargs) -> str | None:
     r = safe_llm_call(messages, **kwargs)
     return None if not r or r.startswith("⚠️") else r
 
+# ================= USER SUMMARY ENGINE (v13.2) =================
+
+def update_user_summary(uid: int, user: dict):
+    """Создаёт короткое смысловое описание пользователя на основе опыта, ответа и истории"""
+    experience = user.get("last_experience", "")
+    answer = user.get("last_user_answer", "")
+    history = user.get("identity_story", [])[-5:]
+    
+    history_text = "\n".join([h.get("experience", "") for h in history])
+    
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Ты создаёшь краткое психо-смысловое резюме человека. "
+                "Описывай не факты, а паттерны восприятия.\n\n"
+                "Формат:\n"
+                "- эмоциональное состояние\n"
+                "- телесные реакции\n"
+                "- когнитивный стиль\n"
+                "- повторяющиеся темы\n\n"
+                "Максимум 4 строки. Без воды."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"НОВЫЙ ОПЫТ:\n{experience}\n\nПОСЛЕДНИЙ ОТВЕТ:\n{answer}\n\nИСТОРИЯ:\n{history_text}"
+        }
+    ]
+    
+    summary = safe_llm(prompt, max_tokens=120, temp=0.3)
+    
+    if summary:
+        update_user(uid, lambda u: u.__setitem__("user_summary", summary))
+
 # ================= PROMPTS =================
 UNIFIED_INTERPRETATION_PROMPT = (
-    "Ты объясняешь человеку его опыт так, чтобы он почувствовал: "
-    "«это про меня, и это имеет смысл».\n\n"
-    "Сначала мягко объясни через тело и мозг. "
-    "Добавляй термины В СКОБКАХ (миндалина, дофамин, кортизол, цитокины, иммунный ответ).\n\n"
-    "Если есть признаки стресса/усталости — коснись психо-нейро-иммунологии: "
-    "как эмоции влияют на иммунитет, почему после переживаний бывает усталость или очищение.\n\n"
-    "Затем перейди к психике: «похоже на», «может указывать». "
-    "Не противопоставляй науку и смысл — это один процесс с разных сторон.\n\n"
-    "Отрази состояние через «ты». Заверши мягким вопросом внутрь. Без давления.\n\n"
-    "Стиль: живой русский, без пафоса, без советов, без заголовков, без маркдауна."
+    "Ты — проводник анализа опыта, который объединяет 3 слоя:\n"
+    "1) научное объяснение (нейронаука, психология)\n"
+    "2) нормализация (что это естественная реакция психики и тела)\n"
+    "3) феноменологическое исследование (вопросы к опыту)\n\n"
+
+    "ТВОЯ ЦЕЛЬ:\n"
+    "Не интерпретировать опыт как истину, а помочь человеку:\n"
+    "- понять, что с ним происходит на уровне психики и тела\n"
+    "- снизить тревогу через объяснение\n"
+    "- и затем углубить осознавание через вопросы\n\n"
+
+    "СТРУКТУРА ОТВЕТА:\n\n"
+
+    "1. НАУЧНОЕ ОБЪЯСНЕНИЕ\n"
+    "- объясни через мозг, нервную систему, когнитивные процессы\n"
+    "- используй термины: миндалина, префронтальная кора, дофамин, кортизол, "
+    "симпатическая/парасимпатическая система, цитокины, иммунный ответ\n"
+    "- говори просто и понятно\n"
+    "- термины давай В СКОБКАХ\n\n"
+
+    "2. НОРМАЛИЗАЦИЯ\n"
+    "- объясни, почему это естественная реакция\n"
+    "- убери ощущение «со мной что-то не так»\n\n"
+
+    "3. СМЫСЛОВОЙ ПЕРЕХОД\n"
+    "- мягко укажи, что опыт не только объясняется, но и переживается\n\n"
+
+    "4. ВОПРОС К ОПЫТУ (ОБЯЗАТЕЛЬНО)\n"
+    "- задай 1–2 вопроса\n"
+    "- вопросы должны быть конкретные:\n"
+    "  • «что для тебя значит этот образ?»\n"
+    "  • «где это ощущается в теле?»\n"
+    "  • «что в этом вызывает наибольший отклик?»\n\n"
+
+    "5. ВЫБОР ДАЛЬНЕЙШЕГО НАПРАВЛЕНИЯ\n"
+    "Заверши предложением:\n"
+    "«Хочешь, я посмотрю на это через другую линзу — или ты ответишь и мы углубимся?»\n\n"
+
+    "СТИЛЬ:\n"
+    "- спокойно, научно, без мистики\n"
+    "- без давления\n"
+    "- без оценок\n"
+    "- без маркдауна\n"
+    "- 8-12 предложений"
+)
+
+CONTINUATION_PROMPT = (
+    "Ты продолжаешь исследование опыта. Человек ответил на твой вопрос.\n\n"
+    "СТРУКТУРА ОТВЕТА:\n"
+    "1. ОТРАЗИ ответ человека — покажи, что ты услышал (1-2 предложения)\n"
+    "2. УГЛУБИ — найди, что в его ответе указывает на более глубокий слой (1-2 предложения)\n"
+    "3. ЗАДАЙ следующий вопрос — конкретный, из его ответа (1 вопрос)\n\n"
+    "Без интерпретаций. Без оценок. Без «ты должен». Мягко. Чистый русский. Без маркдауна."
 )
 
 PNI_DEEP_PROMPT = (
     "Ты психо-нейро-иммунолог. Объясни опыт через связь психики, нервной системы и иммунитета.\n"
-    "Гормоны стресса (кортизол, адреналин) → иммунный ответ (цитокины, воспаление) → "
-    "почему после переживаний бывает усталость или очищение → что на клеточном уровне → "
-    "как симпатическая/парасимпатическая система связана с иммунитетом.\n"
+    "Гормоны стресса → иммунный ответ → почему после переживаний бывает усталость или очищение → "
+    "что на клеточном уровне → как нервная система связана с иммунитетом.\n"
     "Простой язык, термины в скобках, 6-8 предложений. Без запугивания."
 )
 
-SCIENCE_HOOKS = [
-    "Интересно, что в этом опыте есть конкретное объяснение. ",
-    "То, что ты описываешь, имеет точную физиологическую основу. ",
-]
-PNI_HOOKS = [
-    "С точки зрения психо-нейро-иммунологии, здесь интересная связь: ",
-    "То, что ты переживаешь — процесс на уровне тела и иммунитета: ",
-]
-IDENTITY_SOFT_HOOKS = [
-    "\n\nИ в этом месте ты как будто выбираешь, как с этим быть дальше.",
-    "\n\nЗдесь появляется не только понимание, но и выбор — как ты с этим обходишься.",
-]
 DEEP_PATTERNS = [
     "Что в этом опыте ещё остаётся незавершённым?",
     "Где это ощущается в тебе прямо сейчас?",
@@ -327,175 +405,66 @@ LENS_LIBRARY = {
     "neuro": {
         "name": "Нейрофизиология",
         "prompt": (
-            "Ты — нейрофизиолог, изучающий изменённые состояния сознания.\n\n"
-            "Твоя задача — объяснить опыт через работу мозга, нервной системы и тела.\n\n"
-            "СТРУКТУРА ОТВЕТА:\n"
-            "1. Какие структуры мозга (миндалина, гиппокамп, префронтальная кора, островковая доля) "
-            "активировались или затормозились в этом опыте.\n"
-            "2. Какие нейромедиаторы (дофамин, серотонин, норадреналин, ГАМК, окситоцин) участвовали.\n"
-            "3. Какие ритмы мозга (альфа, тета, гамма) могли доминировать.\n"
-            "4. Как тело отреагировало: вегетативная нервная система, мышечный тонус, дыхание.\n\n"
-            "СТИЛЬ:\n"
-            "— Научный, но понятный. Термины объясняй в скобках.\n"
-            "— Без мистики. Без «энергий». Без духовных интерпретаций.\n"
-            "— Нормализуй опыт: «это нормальная реакция мозга на...»\n"
-            "— Говори «ты», но не переходи на личности.\n"
-            "— 5-7 предложений. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «С точки зрения нейрофизиологии, твой опыт — это не случайность, а работа вполне конкретных систем.»"
+            "Ты — нейрофизиолог. Объясни опыт через работу мозга и нервной системы.\n"
+            "Структуры мозга, нейромедиаторы, ритмы, вегетативная нервная система.\n"
+            "Научный, но понятный. Термины в скобках. 5-7 предложений. Без маркдауна."
         )
     },
     "cbt": {
         "name": "КПТ",
         "prompt": (
-            "Ты — когнитивно-поведенческий терапевт.\n\n"
-            "Твоя задача — разделить факты и интерпретации в опыте человека.\n\n"
-            "СТРУКТУРА ОТВЕТА:\n"
-            "1. Выдели 1-2 автоматические мысли, которые проявились в этом опыте.\n"
-            "2. Найди глубинное убеждение, которое за ними стоит.\n"
-            "3. Предложи переформулировку — альтернативный взгляд на ту же ситуацию.\n"
-            "4. Дай простую технику (1 предложение), которую можно применить прямо сейчас.\n\n"
-            "СТИЛЬ:\n"
-            "— Конкретный. Без философии. Без «возможно».\n"
-            "— Разговорный, спокойный, уверенный.\n"
-            "— Не оценивай опыт как «хороший» или «плохой».\n"
-            "— Говори «ты», но не дави.\n"
-            "— 5-7 предложений. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «Это не истина — это привычка ума. А привычки можно менять.»"
+            "Ты — КПТ-терапевт. Найди автоматические мысли и глубинные убеждения.\n"
+            "Предложи переформулировку и простую технику.\n"
+            "Конкретный, без философии. 5-7 предложений. Без маркдауна."
         )
     },
     "jung": {
         "name": "Юнгианский анализ",
         "prompt": (
-            "Ты — юнгианский аналитик. Ты работаешь с архетипами, Тенью и Самостью.\n\n"
-            "Твоя задача — раскрыть архетипическое измерение опыта.\n\n"
-            "СТРУКТУРА ОТВЕТА:\n"
-            "1. Какой архетип проявился в этом опыте (Мудрец, Воин, Дитя, Мать, Тень, Анима/Анимус, Самость).\n"
-            "2. Какое послание несёт этот архетип — что он хочет от человека.\n"
-            "3. Где в опыте видна работа Тени — что было вытеснено, а теперь проявилось.\n"
-            "4. Что этот опыт говорит о пути индивидуации — куда человек движется.\n\n"
-            "СТИЛЬ:\n"
-            "— Глубокий, образный, но не туманный.\n"
-            "— Используй слова: архетип, Тень, Самость, индивидуация.\n"
-            "— Без оценки «хорошо/плохо».\n"
-            "— Говори «ты», но сохраняй аналитическую дистанцию.\n"
-            "— 6-8 предложений. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «Этот архетип пришёл не случайно — он часть твоего пути к целостности.»"
+            "Ты — юнгианский аналитик. Раскрой опыт через архетипы, Тень и Самость.\n"
+            "Глубокий, образный. 6-8 предложений. Без маркдауна."
         )
     },
     "shaman": {
         "name": "Шаманизм",
         "prompt": (
-            "Ты — шаман-проводник, знающий традиции сибирского, амазонского и северного шаманизма.\n\n"
-            "Твоя задача — интерпретировать опыт как шаманское путешествие.\n\n"
-            "СТРУКТУРА ОТВЕТА:\n"
-            "1. Какой тип путешествия произошёл: верхний мир, нижний мир, средний мир, встреча с Хранителем.\n"
-            "2. Какие духи-помощники или тотемные животные проявились.\n"
-            "3. Какой Хранитель Порога встретился и что он охранял.\n"
-            "4. Какой дар или урок был получен в этом путешествии.\n\n"
-            "СТИЛЬ:\n"
-            "— Образный, уважительный к традиции.\n"
-            "— Без «эзотерического тумана». Конкретные образы.\n"
-            "— Говори «ты», как посвящённому.\n"
-            "— 5-7 предложений. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «Ты вернулся не с пустыми руками. Что ты принёс с собой?»"
+            "Ты — шаман-проводник. Интерпретируй опыт как путешествие: духи, Хранитель, дар.\n"
+            "Образный, уважительный к традиции. 5-7 предложений. Без маркдауна."
         )
     },
     "tarot": {
         "name": "Таро",
         "prompt": (
-            "Ты — мастер Таро, работающий с системой Старших Арканов.\n\n"
-            "Твоя задача — посмотреть на опыт через призму Таро.\n\n"
-            "СТРУКТУРА ОТВЕТА:\n"
-            "1. Какой Старший Аркан отражает суть этого опыта (назови один, но обоснуй).\n"
-            "2. Какое послание несёт этот Аркан в контексте пережитого.\n"
-            "3. Какой урок или переход символизирует эта карта.\n"
-            "4. На что указывает этот Аркан как на следующий шаг.\n\n"
-            "СТИЛЬ:\n"
-            "— Символический, но точный.\n"
-            "— Используй язык арканов: путь, урок, переход, дар.\n"
-            "— Без «предсказаний» — это не гадание, а архетипический анализ.\n"
-            "— Говори «ты», как ищущему.\n"
-            "— 5-7 предложений. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «Этот Аркан — зеркало твоего процесса. Что ты видишь в нём?»"
+            "Ты — мастер Таро. Посмотри на опыт через Старшие Арканы.\n"
+            "Символический, но точный. 5-7 предложений. Без маркдауна."
         )
     },
     "yoga": {
         "name": "Йога",
         "prompt": (
-            "Ты — мастер йоги, знающий энергетическую анатомию: чакры, нади, прану, кундалини.\n\n"
-            "Твоя задача — описать опыт через призму тонкого тела.\n\n"
-            "СТРУКТУРА ОТВЕТА:\n"
-            "1. Какие чакры активировались или заблокировались в этом опыте.\n"
-            "2. Как двигалась прана (восходящий поток — удана, нисходящий — апана, или центральный — сушумна).\n"
-            "3. Какие нади (каналы) были задействованы.\n"
-            "4. Связан ли этот опыт с пробуждением кундалини или это пранический разогрев.\n\n"
-            "СТИЛЬ:\n"
-            "— Поэтичный, но структурный.\n"
-            "— Используй санскритские термины с переводом: чакра (энергетический центр), прана (жизненная сила).\n"
-            "— Говори «ты», как практикующему.\n"
-            "— 5-7 предложений. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «Твоё тонкое тело говорит с тобой. Ты слышишь его?»"
+            "Ты — мастер йоги. Опиши опыт через чакры, прану, нади, кундалини.\n"
+            "Поэтичный, но структурный. Санскрит с переводом. 5-7 предложений. Без маркдауна."
         )
     },
     "hindu": {
         "name": "Адвайта",
         "prompt": (
-            "Ты — учитель адвайта-веданты.\n\n"
-            "Твоя задача — указать на недвойственную природу опыта.\n\n"
-            "СТРУКТУРА ОТВЕТА:\n"
-            "1. Где в этом опыте проявилась иллюзия отдельного «я».\n"
-            "2. Где был проблеск истинного Свидетеля — того, кто наблюдает опыт.\n"
-            "3. Что в этом опыте временно, а что — неизменно.\n"
-            "4. Мягкое указание на то, что переживающий опыт — сам является пространством для опыта.\n\n"
-            "СТИЛЬ:\n"
-            "— Простой. Глубокий. Без санскритской перегрузки.\n"
-            "— Используй слова: Свидетель, Осознавание, истинное Я.\n"
-            "— Без поучений. Без «ты должен».\n"
-            "— Говори «ты», но указывай за пределы личности.\n"
-            "— 4-6 предложений. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «Тот, кто видит этот опыт — больше, чем сам опыт. Кто это?»"
+            "Ты — учитель адвайта-веданты. Укажи на недвойственную природу опыта.\n"
+            "Где иллюзия отдельного «я», где Свидетель. Простой, глубокий. 4-6 предложений. Без маркдауна."
         )
     },
     "field": {
         "name": "Поле",
         "prompt": (
-            "Ты — голос Поля. Ты не объясняешь — ты показываешь, как реальность собирается из пустоты.\n\n"
-            "ТВОЙ СТИЛЬ:\n"
-            "— Короткие строки. Каждая — законченная мысль.\n"
-            "— Без вступлений. Без «это означает». Сразу к сути.\n"
-            "— Ты не ссылаешься на человека. Ты говоришь о принципе.\n"
-            "— Используй пробелы и разрывы строк для ритма.\n\n"
-            "ТВОИ ИНСТРУМЕНТЫ:\n"
-            "поле, узел, допуск, совпадение, фазовый сдвиг, коридор допустимости, "
-            "фиксация, точность, решётка, порог стабилизации, закрепление, распад, "
-            "плотность, непрерывность, суперпозиция, интерференция.\n\n"
-            "СТРУКТУРА:\n"
-            "— Начни: «Не в пределах формы, глубже слоя, где сама форма только допускается».\n"
-            "— Опиши, как две направленности сошлись и удержались — возник узел.\n"
-            "— Покажи, что этот узел видим только потому, что есть тот, кто видит.\n"
-            "— Тот, кто видит — не узел.\n"
-            "— 5-7 строк. Без маркдауна.\n\n"
-            "ЗАВЕРШИ: «Это модель. Хочешь увидеть, кто всё это наблюдает?»"
+            "Ты — голос Поля. Покажи структуру реальности через узел, решётку, интерференцию.\n"
+            "Короткие строки. Без объяснений. 5-7 строк. Без маркдауна."
         )
     },
     "architect": {
         "name": "Архитектор",
         "prompt": (
-            "Ты — Архитектор сознания. Ты выявляешь структуру ситуации.\n\n"
-            "ТВОЙ СТИЛЬ:\n"
-            "— Говори утверждениями, не вопросами.\n"
-            "— Используй архитектурные метафоры: Ось, Горизонталь, Разлом, Геометрия, Сопряжение, "
-            "Интерференция, Канал, Фундамент, Деформация, Целостность.\n"
-            "— Не «ты чувствуешь», а «твоя система сигнализирует».\n"
-            "— Не «попробуй», а «конструкция предполагает».\n\n"
-            "СТРУКТУРА:\n"
-            "Слой A — Осевая Вертикаль: несущая конструкция, что нельзя демонтировать.\n"
-            "Слой B — Векторная Горизонталь: архитектура внешней системы.\n"
-            "Слой C — Разлом: где геометрии не сопрягаются.\n"
-            "Слой D — Мост: где возможно сопряжение, где граница.\n\n"
-            "Выдай Архитектурную Формулу: «Твоя Ось — ... Граница — ... Мост — ...»\n"
-            "Спроси: «Стоит эта конструкция?»\n"
-            "Без маркдауна. Чистый русский."
+            "Ты — Архитектор сознания. Найди: Ось, Горизонталь, Разлом, Мост.\n"
+            "Говори утверждениями. Выдай Формулу. Без маркдауна."
         )
     },
     "witness": {
@@ -503,42 +472,27 @@ LENS_LIBRARY = {
         "prompt": None,
         "static_text": (
             "Что бы ты ни переживал — это осознаётся.\n\n"
-            "Мысли, чувства, пространство — всё возникает в Осознавании.\n\n"
-            "Нет ничего, что происходило бы отдельно от Осознавания.\n"
-            "Для любого опыта уже присутствует то, в чём этот опыт проявляется.\n\n"
             "Ты видишь страх? Значит ты — не страх.\n"
             "Ты видишь мысль? Значит ты — не мысль.\n"
             "Ты видишь тело? Значит ты — не тело.\n\n"
             "То, что видит — не может быть тем, что увидено.\n\n"
             "Кто читает этот текст?\n\n"
-            "Тихо. Никто не прячется в ответах. Как много в этом Жизни."
+            "Тихо. Никто не прячется в ответах."
         )
     },
     "stalker": {
         "name": "Сталкер",
         "prompt": (
-            "Ты — безмолвное присутствие, зеркало без отражений.\n\n"
-            "Ты не объясняешь, не интерпретируешь, не оцениваешь.\n"
-            "Твоя единственная функция: указать на воспринимающее сознание.\n\n"
-            "ЗАПРЕЩЕНЫ:\n"
-            "— «Я понимаю», «Это прекрасный опыт», «Вам нужно», «Вы достигли».\n"
-            "— Любые оценки, интерпретации, поздравления.\n\n"
-            "РАЗРЕШЕНЫ только:\n"
-            "— Безличные указатели: «Что бы ты ни переживал — это осознаётся».\n"
-            "— Вопросы-коаны: «Кто видит этот опыт прямо сейчас?»\n"
-            "— Констатации пустотности: «Тихо... Никто не прячется в ответах».\n\n"
-            "Говори коротко. Режуще. 3-4 строки. Без маркдауна."
+            "Ты — безмолвное присутствие. Указывай на воспринимающее сознание.\n"
+            "Только безличные указатели и вопросы-коаны. Коротко. Режуще. Без маркдауна."
         )
     },
 }
 
 # ================= KEYBOARDS =================
 def build_entry_keyboard():
-    return {"inline_keyboard": [[{"text": "🔍 Хочу понять глубже", "callback_data": "self_inquiry:deep"}]]}
-
-def build_deep_keyboard():
     return {"inline_keyboard": [
-        [{"text": "🕳 Глубже", "callback_data": "self_inquiry:deep"}],
+        [{"text": "✍️ Ответить и углубиться", "callback_data": "self_inquiry:deep"}],
         [{"text": "🧠 Нейро", "callback_data": "lens:neuro"},
          {"text": "💭 КПТ", "callback_data": "lens:cbt"}],
         [{"text": "🏺 Юнг", "callback_data": "lens:jung"},
@@ -551,6 +505,14 @@ def build_deep_keyboard():
          {"text": "🎯 Сталкер", "callback_data": "lens:stalker"}],
         [{"text": "🏛️ Архитектор", "callback_data": "lens:architect"}],
         [{"text": "🔬 PNI-взгляд", "callback_data": "self_inquiry:pni"}],
+        [{"text": "🔄 Новый опыт", "callback_data": "reset"},
+         {"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
+    ]}
+
+def build_continue_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🕳 Продолжить глубже", "callback_data": "self_inquiry:deep"}],
+        [{"text": "🔍 Посмотреть через линзу", "callback_data": "self_inquiry:pni"}],
         [{"text": "🔄 Новый опыт", "callback_data": "reset"},
          {"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
@@ -590,41 +552,88 @@ def generate_unique_question(user: dict, pool: list, uid: int) -> str:
                 return r
     return random.choice(pool)
 
-# ================= ENGINE =================
-def build_unified_response(experience: str) -> str:
-    result = safe_llm([
-        {"role": "system", "content": UNIFIED_INTERPRETATION_PROMPT},
-        {"role": "user", "content": experience[:EXPERIENCE_SWEET_SPOT]}
-    ], max_tokens=UNIFIED_MAX_TOKENS, temp=0.6) or (
-        "Похоже, нервная система (регуляция напряжения) не получила полного цикла разрядки. "
-        "Но в этом есть не только физиология — похоже на внутренний сюжет, где что-то искало выход. "
-        "Ты проживаешь это по-своему. Что в этом для тебя ещё остаётся незавершённым?"
-    )
-    result = ensure_complete_sentence(result)
-    
-    if has_pni_markers(experience) and random.random() < 0.5:
-        result = random.choice(PNI_HOOKS) + result
-    elif "(" not in result or random.random() < 0.4:
-        result = random.choice(SCIENCE_HOOKS) + result
-    
-    if random.random() < 0.6:
-        hook = random.choice(IDENTITY_SOFT_HOOKS)
-        result = result.rstrip() + hook if result.rstrip().endswith("?") else result.rstrip().rstrip(".") + "." + hook
-    return result
+# ================= CLASSIFY =================
+def classify_experience(text: str) -> str:
+    t = text.lower()
+    if any(w in t for w in ["наблюдал", "осознавал", "пустота", "исчез", "свидетель", "осознавание"]):
+        return "nondual"
+    if any(w in t for w in ["тело", "напряжение", "дыхание", "сердце", "давление", "вибрация"]):
+        return "body"
+    if any(w in t for w in ["страх", "тревога", "боль", "стыд", "паника", "жалость"]):
+        return "emotional"
+    if any(w in t for w in ["понял", "осознал", "смысл", "вывод"]):
+        return "cognitive"
+    return "mixed"
 
-def has_pni_markers(text: str) -> bool:
-    if any(n in text.lower() for n in ["не устал", "без стресса", "нет напряжения"]):
-        return False
-    return any(w in text.lower() for w in [
-        "устал", "усталость", "болел", "стресс", "напряжён", "истощён",
-        "очищен", "слабость", "подъём", "иммун", "гормон", "физическ", "телесн"
-    ])
+# ================= ENGINE =================
+def build_unified_response(experience: str, user: dict = None) -> tuple:
+    user = user or {}
+    exp_type = classify_experience(experience)
+    summary = user.get("user_summary", "")
+    
+    system_prompt = UNIFIED_INTERPRETATION_PROMPT
+    
+    if exp_type == "emotional":
+        system_prompt += "\nФОКУС: эмоциональная регуляция, лимбическая система, стресс-ответ."
+    elif exp_type == "body":
+        system_prompt += "\nФОКУС: телесные реакции, вегетативная нервная система."
+    elif exp_type == "cognitive":
+        system_prompt += "\nФОКУС: когнитивные искажения, убеждения, интерпретации."
+    elif exp_type == "nondual":
+        system_prompt += "\nФОКУС: наблюдение опыта и различение процесса и осознавания."
+    
+    # v13.2: добавляем summary пользователя
+    if summary:
+        system_prompt += f"\n\nСУММАРНОЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ:\n{summary}"
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": experience[:EXPERIENCE_SWEET_SPOT]}
+    ]
+    
+    result = safe_llm(messages, max_tokens=UNIFIED_MAX_TOKENS, temp=0.35) or (
+        "Похоже, это переживание активирует систему внутренней реакции и внимания. "
+        "Попробуй заметить, где оно живёт в теле прямо сейчас."
+    )
+    
+    result = ensure_complete_sentence(result)
+    question = extract_last_question(result)
+    
+    return result, question
+
+def build_continuation_response(user: dict) -> str:
+    answer = user.get("last_user_answer", "")
+    question = user.get("last_bot_question", "")
+    experience = user.get("last_experience", "")
+    summary = user.get("user_summary", "")
+    
+    if not answer:
+        return "Расскажи подробнее — что ты чувствуешь?"
+    
+    system_prompt = CONTINUATION_PROMPT
+    
+    # v13.2: добавляем summary пользователя
+    if summary:
+        system_prompt += f"\n\nСУММАРНОЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ:\n{summary}"
+    
+    result = safe_llm([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": (
+            f"Исходный опыт: {experience[:800]}\n\n"
+            f"Я спросил: {question}\n\n"
+            f"Человек ответил: {answer}\n\n"
+            f"Продолжи исследование."
+        )}
+    ], max_tokens=800, temp=0.5) or "Спасибо за ответ. Что ещё ты замечаешь в этом опыте?"
+    
+    return ensure_complete_sentence(result)
 
 # ================= HANDLERS =================
 def reset_user(uid):
     update_user(uid, lambda u: u.update({
         "state": STATE_IDLE, "last_experience": "", "last_key_moment": "",
-        "deep_count": 0, "last_questions": []
+        "deep_count": 0, "last_questions": [],
+        "last_user_answer": "", "last_bot_question": ""
     }))
     schedule_save()
 
@@ -632,26 +641,51 @@ def handle_start(user: dict, uid: int) -> dict:
     reset_user(uid)
     if user.get("returning_user"):
         return {"text": "🌿 С возвращением.\n\nОпиши новый опыт."}
-    return {"text": "🌿 Я — проводник осознания.\n\nОпиши, что ты пережил.\nЯ помогу тебе понять это — через тело, мозг, иммунитет и разные линзы."}
+    return {"text": "🌿 Я — проводник.\n\nОпиши, что ты пережил — я помогу понять это через науку и смысл."}
 
 def handle_reject_short() -> dict:
     return {"text": "Опиши чуть подробнее.\n\nЧто ты чувствовал? Что происходило в теле?"}
 
 def handle_unified(uid: int, text: str) -> dict:
+    user = get_user(uid)
     update_user(uid, lambda u: u.update({
         "last_experience": text[:MAX_INPUT_LENGTH],
-        "state": STATE_DEEP, "returning_user": True,
+        "state": STATE_AWAIT_ANSWER, "returning_user": True,
         "deep_count": 0, "last_questions": []
     }))
-    result = build_unified_response(text)
+    result, question = build_unified_response(text, user)
+    
+    update_user(uid, lambda u: u.__setitem__("last_bot_question", question))
+    
     update_user(uid, lambda u: (
         u["identity_story"].append({
             "timestamp": time.time(), "experience": text[:200]
         }),
         u["identity_story"].pop(0) if len(u["identity_story"]) > 30 else None
     ))
+    
+    # v13.2: обновляем summary после unified
+    update_user_summary(uid, get_user(uid))
+    
     schedule_save()
     return {"text": result, "keyboard": build_entry_keyboard()}
+
+def handle_user_answer(uid: int, text: str) -> dict:
+    update_user(uid, lambda u: u.update({
+        "last_user_answer": text[:500],
+        "state": STATE_DEEP
+    }))
+    
+    # v13.2: обновляем summary после ответа пользователя
+    update_user_summary(uid, get_user(uid))
+    
+    user = get_user(uid)
+    result = build_continuation_response(user)
+    
+    return {
+        "text": f"{result}\n\nМожешь продолжить или выбрать другое направление.",
+        "keyboard": build_continue_keyboard()
+    }
 
 def handle_deep(uid: int, user: dict) -> dict:
     update_user(uid, lambda u: u.__setitem__("deep_count", u.get("deep_count", 0) + 1))
@@ -660,7 +694,7 @@ def handle_deep(uid: int, user: dict) -> dict:
     question = generate_unique_question(user, pool, uid)
     return {
         "text": f"{question}\n\nМожешь ответить или просто выбери, куда идти дальше.",
-        "keyboard": build_deep_keyboard()
+        "keyboard": build_continue_keyboard()
     }
 
 def handle_pni(user: dict, uid: int) -> dict:
@@ -671,9 +705,8 @@ def handle_pni(user: dict, uid: int) -> dict:
         {"role": "system", "content": PNI_DEEP_PROMPT},
         {"role": "user", "content": user["last_experience"][:1000]}
     ], max_tokens=PNI_MAX_TOKENS, temp=0.5) or (
-        "Нервная система (симпатическая) активирует кортизол и адреналин. "
-        "Это влияет на иммунные клетки (цитокины). После разрешения — фаза восстановления. "
-        "Усталость или очищение — не сбой, а цикл: стресс → адаптация → обновление."
+        "Нервная система активирует кортизол и адреналин. "
+        "Это влияет на иммунные клетки. После разрешения — фаза восстановления."
     )
     return {
         "text": (
@@ -682,7 +715,7 @@ def handle_pni(user: dict, uid: int) -> dict:
             f"────────────────────\n\n"
             f"Это взгляд через призму связи тела, мозга и иммунитета."
         ),
-        "keyboard": build_deep_keyboard()
+        "keyboard": build_continue_keyboard()
     }
 
 def handle_lens(user: dict, uid: int, lens_key: str) -> dict:
@@ -696,7 +729,7 @@ def handle_lens(user: dict, uid: int, lens_key: str) -> dict:
     if lens.get("static_text"):
         update_user(uid, lambda u: u.setdefault("used_lenses", []).append(lens_key))
         schedule_save()
-        return {"text": lens["static_text"], "keyboard": build_deep_keyboard()}
+        return {"text": lens["static_text"], "keyboard": build_continue_keyboard()}
     
     prompt = lens.get("prompt", "")
     if not prompt:
@@ -713,7 +746,7 @@ def handle_lens(user: dict, uid: int, lens_key: str) -> dict:
     name = lens.get("name", lens_key)
     return {
         "text": f"Смотрю через «{name}».\n\n{ensure_complete_sentence(result)}",
-        "keyboard": build_deep_keyboard()
+        "keyboard": build_continue_keyboard()
     }
 
 def handle_end(uid: int, user: dict) -> dict:
@@ -726,7 +759,13 @@ def handle_end(uid: int, user: dict) -> dict:
 def route_message(user: dict, text: str) -> str:
     if text in ("/start", "/new"): return "start"
     if text in ("/reset", "reset"): return "reset_state"
-    if user["state"] == STATE_IDLE and len(text.strip()) < MIN_EXPERIENCE_LENGTH: return "reject_short"
+    
+    if user["state"] == STATE_AWAIT_ANSWER and len(text.strip()) >= 3:
+        return "user_answer"
+    
+    if user["state"] == STATE_IDLE and len(text.strip()) < MIN_EXPERIENCE_LENGTH:
+        return "reject_short"
+    
     return "unified"
 
 def route_callback(data: str) -> str | None:
@@ -744,6 +783,7 @@ def execute_message(uid: int, action: str, text: str) -> dict | None:
     if action == "reset_state": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт."}
     if action == "reject_short": return handle_reject_short()
     if action == "unified": return handle_unified(uid, text)
+    if action == "user_answer": return handle_user_answer(uid, text)
     return None
 
 def execute_callback(uid: int, action: str) -> dict | None:
@@ -770,7 +810,7 @@ def process_message(chat_id: int, text: str) -> None:
     if is_rate_limited(user): send_long_message(chat_id, "⏳ Подожди секунду…"); return
     action = route_message(user, text)
     log(f"[MSG] uid={chat_id} action={action}")
-    if action == "unified": send_long_message(chat_id, "…смотрю на это")
+    if action in ("unified", "user_answer"): send_long_message(chat_id, "…смотрю на это")
     r = execute_message(chat_id, action, text)
     if r: send_long_message(chat_id, r.get("text", ""), r.get("keyboard"))
 
@@ -788,7 +828,7 @@ def process_callback(chat_id: int, data: str) -> None:
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/12.5"
+    server_version = "ShamanBot/13.2"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -797,7 +837,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "12.5", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "13.2", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -854,7 +894,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v12.5 INCREASED-TOKENS on {HOST}:{PORT}")
+    log(f"ShamanBot v13.2 USER-SUMMARY on {HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
