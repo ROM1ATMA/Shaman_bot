@@ -55,8 +55,10 @@ STATE_DEEP = "deep"
 STATE_PNI = "pni"
 
 VALID_CALLBACKS = {
-    "self_inquiry:deep", "self_inquiry:end",
-    "self_inquiry:pni", "reset",
+    "self_inquiry:deep", "self_inquiry:end", "self_inquiry:pni", "reset",
+    "lens:neuro", "lens:cbt", "lens:jung", "lens:shaman",
+    "lens:tarot", "lens:yoga", "lens:hindu", "lens:field",
+    "lens:witness", "lens:stalker", "lens:architect",
 }
 
 users = {}
@@ -67,7 +69,7 @@ USER_DEFAULTS = {
     "last_key_moment": "", "returning_user": False,
     "identity_story": [], "deep_count": 0,
     "last_request_time": 0, "last_update_hash": "", "last_update_time": 0,
-    "last_questions": [],
+    "last_questions": [], "used_lenses": [],
 }
 
 # ================= USERS =================
@@ -318,16 +320,76 @@ DEEP_PATTERNS = [
     "Какую часть себя ты узнаёшь в этом опыте?",
 ]
 
+# ================= LENS LIBRARY =================
+LENS_LIBRARY = {
+    "neuro": {
+        "name": "Нейрофизиология",
+        "prompt": "Ты — нейрофизиолог. Объясни этот опыт через работу мозга и нервной системы. Чистый русский, без маркдауна."
+    },
+    "cbt": {
+        "name": "КПТ",
+        "prompt": "Ты — КПТ-терапевт. Найди автоматические мысли и глубинные убеждения в этом опыте. Чистый русский."
+    },
+    "jung": {
+        "name": "Юнгианский анализ",
+        "prompt": "Ты — юнгианский аналитик. Раскрой опыт через архетипы: Тень, Анима/Анимус, Самость, Мудрец. Чистый русский."
+    },
+    "shaman": {
+        "name": "Шаманизм",
+        "prompt": "Ты — шаман-проводник. Интерпретируй опыт как путешествие: духи-помощники, Хранитель Порога. Чистый русский."
+    },
+    "tarot": {
+        "name": "Таро",
+        "prompt": "Ты — мастер Таро. Посмотри на опыт через Старшие Арканы. Чистый русский."
+    },
+    "yoga": {
+        "name": "Йога",
+        "prompt": "Ты — мастер йоги. Опиши энергетические процессы: чакры, прана, каналы. Чистый русский."
+    },
+    "hindu": {
+        "name": "Адвайта",
+        "prompt": "Ты — учитель адвайта-веданты. Где здесь Свидетель? Чистый русский."
+    },
+    "field": {
+        "name": "Поле",
+        "prompt": "Ты — голос Поля. Узел, решётка, фазовый сдвиг, интерференция. Чистый русский."
+    },
+    "architect": {
+        "name": "Архитектор",
+        "prompt": "Ты — Архитектор сознания. Найди: Ось, Горизонталь, Разлом, Мост. Чистый русский."
+    },
+    "witness": {
+        "name": "Наблюдатель",
+        "prompt": None,
+        "static_text": "Что бы ты ни переживал — это осознаётся.\n\nТы видишь мысль? Значит ты — не мысль.\nТы видишь страх? Значит ты — не страх.\nТы видишь тело? Значит ты — не тело.\n\nТо, что видит — не может быть тем, что увидено.\n\nКто читает этот текст?\n\nТихо. Никто не прячется в ответах."
+    },
+    "stalker": {
+        "name": "Сталкер",
+        "prompt": "Ты — безмолвное присутствие. Указывай на того, кто видит этот опыт. Чистый русский."
+    },
+}
+
 # ================= KEYBOARDS =================
 def build_entry_keyboard():
     return {"inline_keyboard": [[{"text": "🔍 Хочу понять глубже", "callback_data": "self_inquiry:deep"}]]}
 
 def build_deep_keyboard():
     return {"inline_keyboard": [
-        [{"text": "🕳 Ещё глубже", "callback_data": "self_inquiry:deep"}],
-        [{"text": "🔬 Взгляд психо-нейро-иммунолога", "callback_data": "self_inquiry:pni"}],
-        [{"text": "🔄 Новый опыт", "callback_data": "reset"}],
-        [{"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
+        [{"text": "🕳 Глубже", "callback_data": "self_inquiry:deep"}],
+        [{"text": "🧠 Нейро", "callback_data": "lens:neuro"},
+         {"text": "💭 КПТ", "callback_data": "lens:cbt"}],
+        [{"text": "🏺 Юнг", "callback_data": "lens:jung"},
+         {"text": "🦅 Шаман", "callback_data": "lens:shaman"}],
+        [{"text": "🃏 Таро", "callback_data": "lens:tarot"},
+         {"text": "🧘 Йога", "callback_data": "lens:yoga"}],
+        [{"text": "🕉️ Адвайта", "callback_data": "lens:hindu"},
+         {"text": "🌐 Поле", "callback_data": "lens:field"}],
+        [{"text": "👁️ Наблюдатель", "callback_data": "lens:witness"},
+         {"text": "🎯 Сталкер", "callback_data": "lens:stalker"}],
+        [{"text": "🏛️ Архитектор", "callback_data": "lens:architect"}],
+        [{"text": "🔬 PNI-взгляд", "callback_data": "self_inquiry:pni"}],
+        [{"text": "🔄 Новый опыт", "callback_data": "reset"},
+         {"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
 
 # ================= ANTI-REPEAT =================
@@ -432,7 +494,11 @@ def handle_deep(uid: int, user: dict) -> dict:
     update_user(uid, lambda u: u.__setitem__("deep_count", u.get("deep_count", 0) + 1))
     depth = user.get("deep_count", 1)
     pool = DEEP_PATTERNS[:3] if depth <= 2 else DEEP_PATTERNS[2:5] if depth <= 4 else DEEP_PATTERNS[3:]
-    return {"text": generate_unique_question(user, pool, uid), "keyboard": build_deep_keyboard()}
+    question = generate_unique_question(user, pool, uid)
+    return {
+        "text": f"{question}\n\nМожешь ответить или просто выбери, куда идти дальше.",
+        "keyboard": build_deep_keyboard()
+    }
 
 def handle_pni(user: dict, uid: int) -> dict:
     if not user.get("last_experience"):
@@ -446,7 +512,48 @@ def handle_pni(user: dict, uid: int) -> dict:
         "Это влияет на иммунные клетки (цитокины). После разрешения — фаза восстановления. "
         "Усталость или очищение — не сбой, а цикл: стресс → адаптация → обновление."
     )
-    return {"text": f"🔬 ВЗГЛЯД ПСИХО-НЕЙРО-ИММУНОЛОГА\n\n{ensure_complete_sentence(result)}\n\n────────────────────\n\nЭто взгляд через призму связи тела, мозга и иммунитета.", "keyboard": build_deep_keyboard()}
+    return {
+        "text": (
+            f"🔬 ВЗГЛЯД ПСИХО-НЕЙРО-ИММУНОЛОГА\n\n"
+            f"{ensure_complete_sentence(result)}\n\n"
+            f"────────────────────\n\n"
+            f"Это взгляд через призму связи тела, мозга и иммунитета."
+        ),
+        "keyboard": build_deep_keyboard()
+    }
+
+def handle_lens(user: dict, uid: int, lens_key: str) -> dict:
+    """Применяет выбранную линзу к последнему опыту"""
+    if not user.get("last_experience"):
+        return {"text": "Сначала опиши опыт."}
+    
+    lens = LENS_LIBRARY.get(lens_key, {})
+    if not lens:
+        return {"text": "Линза не найдена."}
+    
+    # Статический текст (witness)
+    if lens.get("static_text"):
+        update_user(uid, lambda u: u.setdefault("used_lenses", []).append(lens_key))
+        schedule_save()
+        return {"text": lens["static_text"], "keyboard": build_deep_keyboard()}
+    
+    prompt = lens.get("prompt", "")
+    if not prompt:
+        return {"text": "Линза не настроена."}
+    
+    result = safe_llm([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": user["last_experience"][:EXPERIENCE_SWEET_SPOT]}
+    ], max_tokens=600, temp=0.7) or "Не удалось применить линзу."
+    
+    update_user(uid, lambda u: u.setdefault("used_lenses", []).append(lens_key))
+    schedule_save()
+    
+    name = lens.get("name", lens_key)
+    return {
+        "text": f"Смотрю через «{name}».\n\n{ensure_complete_sentence(result)}\n\nЧто ты возьмёшь из этого?",
+        "keyboard": build_deep_keyboard()
+    }
 
 def handle_end(uid: int, user: dict) -> dict:
     ic = len(user.get("identity_story", []))
@@ -462,7 +569,11 @@ def route_message(user: dict, text: str) -> str:
     return "unified"
 
 def route_callback(data: str) -> str | None:
-    return data if data in VALID_CALLBACKS else None
+    if data in VALID_CALLBACKS:
+        return data
+    if data.startswith("lens:"):
+        return data
+    return None
 
 # ================= EXECUTE =================
 def execute_message(uid: int, action: str, text: str) -> dict | None:
@@ -477,10 +588,17 @@ def execute_message(uid: int, action: str, text: str) -> dict | None:
 def execute_callback(uid: int, action: str) -> dict | None:
     user = get_user(uid)
     user["_uid"] = uid
+    
     if action == "reset": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт."}
     if action == "self_inquiry:deep": return handle_deep(uid, user)
     if action == "self_inquiry:pni": return handle_pni(user, uid)
     if action == "self_inquiry:end": return handle_end(uid, user)
+    
+    # 🔥 Линзы
+    if action.startswith("lens:"):
+        lens_key = action.replace("lens:", "")
+        return handle_lens(user, uid, lens_key)
+    
     return None
 
 # ================= PROCESS =================
@@ -503,13 +621,14 @@ def process_callback(chat_id: int, data: str) -> None:
     action = route_callback(data)
     if not action: return
     log(f"[CB] uid={chat_id} action={action}")
-    if action in ("self_inquiry:deep", "self_inquiry:pni"): send_long_message(chat_id, "…смотрю глубже")
+    if action in ("self_inquiry:deep", "self_inquiry:pni") or action.startswith("lens:"):
+        send_long_message(chat_id, "…смотрю глубже")
     r = execute_callback(chat_id, action)
     if r: send_long_message(chat_id, r.get("text", ""), r.get("keyboard"))
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/12.2.1"
+    server_version = "ShamanBot/12.3"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -518,7 +637,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "12.2.1", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "12.3", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -575,7 +694,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v12.2.1 HOTFIX on {HOST}:{PORT}")
+    log(f"ShamanBot v12.3 FULL-LENS on {HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
