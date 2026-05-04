@@ -4,6 +4,7 @@ import sys
 import time
 import re
 import random
+import hashlib
 import traceback
 import signal
 import httpx
@@ -38,9 +39,8 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-# 🔥 Только две блокировки
-users_lock = Lock()     # Единственная защита users
-dedup_lock = Lock()     # Защита processed_updates
+users_lock = Lock()
+dedup_lock = Lock()
 
 # ================= LOGGING =================
 def utc_now() -> str:
@@ -70,8 +70,7 @@ USER_DEFAULTS = {
     "last_questions": [],
 }
 
-# ================= USERS — ЕДИНАЯ МОДЕЛЬ МУТАЦИЙ =================
-
+# ================= USERS =================
 def load_users():
     global users
     for path in ["data/users.json", "data/users.tmp.json"]:
@@ -123,20 +122,18 @@ def schedule_save():
 def force_save():
     save_users_sync()
 
-# 🔥 ЕДИНСТВЕННЫЙ СПОСОБ МУТАЦИИ
 def update_user(uid: int, fn):
     with users_lock:
         if uid in users:
             fn(users[uid])
 
-# 🔥 ЕДИНСТВЕННЫЙ СПОСОБ ПОЛУЧЕНИЯ — возвращает копию под локом
 def get_user(uid: int) -> dict:
     uid = int(uid)
     with users_lock:
         if uid not in users:
             users[uid] = dict(USER_DEFAULTS)
         users[uid]["last_active"] = time.time()
-        return dict(users[uid])  # 🔥 Копия — безопасно для чтения вне лока
+        return dict(users[uid])
 
 # ================= HTTP CLIENTS =================
 telegram_client = httpx.Client(
@@ -221,7 +218,6 @@ def send_long_message(chat_id: int, text: str, keyboard: dict = None) -> bool:
     if not text:
         return False
     
-    # 🔥 Без html.escape — чистый текст
     text = ensure_complete_sentence(text)
     
     chunks = []
@@ -342,14 +338,17 @@ def normalize_question(text: str) -> str:
     t = re.sub(r"[^\w\s]", "", text.lower())
     return " ".join([w for w in t.split() if w not in STOP_WORDS][:6])
 
-def generate_unique_question(user: dict, pool: list) -> str:
+def generate_unique_question(user: dict, pool: list, uid: int) -> str:
     history = user.get("last_questions", [])
     shuffled = pool.copy()
     random.shuffle(shuffled)
     for q in shuffled:
         n = normalize_question(q)
         if n and len(n) >= 2 and n not in history:
-            update_user(int(user.get("_uid", 0)), lambda u: u["last_questions"].append(n) if len(u["last_questions"]) < MAX_QUESTION_HISTORY else u["last_questions"].__setitem__(slice(1, None), u["last_questions"][1:] + [n]))
+            update_user(uid, lambda u: (
+                u["last_questions"].append(n),
+                u["last_questions"].pop(0) if len(u["last_questions"]) > MAX_QUESTION_HISTORY else None
+            ))
             return q
     for attempt in range(2):
         r = safe_llm([
@@ -359,12 +358,15 @@ def generate_unique_question(user: dict, pool: list) -> str:
         if r:
             n = normalize_question(r)
             if n and len(n) >= 2 and n not in history:
-                update_user(int(user.get("_uid", 0)), lambda u: u["last_questions"].append(n) if len(u["last_questions"]) < MAX_QUESTION_HISTORY else None)
+                update_user(uid, lambda u: (
+                    u["last_questions"].append(n),
+                    u["last_questions"].pop(0) if len(u["last_questions"]) > MAX_QUESTION_HISTORY else None
+                ))
                 return r
     return random.choice(pool)
 
 # ================= ENGINE =================
-def build_unified_response(experience: str, user: dict) -> str:
+def build_unified_response(experience: str) -> str:
     result = safe_llm([
         {"role": "system", "content": UNIFIED_INTERPRETATION_PROMPT},
         {"role": "user", "content": experience[:EXPERIENCE_SWEET_SPOT]}
@@ -410,18 +412,18 @@ def handle_start(user: dict, uid: int) -> dict:
 def handle_reject_short() -> dict:
     return {"text": "Опиши чуть подробнее.\n\nЧто ты чувствовал? Что происходило в теле?"}
 
-def handle_unified(uid: int, user: dict, text: str) -> dict:
+def handle_unified(uid: int, text: str) -> dict:
     update_user(uid, lambda u: u.update({
         "last_experience": text[:MAX_INPUT_LENGTH],
         "state": STATE_DEEP, "returning_user": True,
         "deep_count": 0, "last_questions": []
     }))
-    result = build_unified_response(text, user)
-    update_user(uid, lambda u: u["identity_story"].append({
-        "timestamp": time.time(), "experience": text[:200],
-        "moment": user.get("last_key_moment", "")
-    }) if len(u["identity_story"]) < 30 else u["identity_story"].__setitem__(
-        slice(1, None), u["identity_story"][1:] + [{"timestamp": time.time(), "experience": text[:200]}]
+    result = build_unified_response(text)
+    update_user(uid, lambda u: (
+        u["identity_story"].append({
+            "timestamp": time.time(), "experience": text[:200]
+        }),
+        u["identity_story"].pop(0) if len(u["identity_story"]) > 30 else None
     ))
     schedule_save()
     return {"text": result, "keyboard": build_entry_keyboard()}
@@ -430,7 +432,7 @@ def handle_deep(uid: int, user: dict) -> dict:
     update_user(uid, lambda u: u.__setitem__("deep_count", u.get("deep_count", 0) + 1))
     depth = user.get("deep_count", 1)
     pool = DEEP_PATTERNS[:3] if depth <= 2 else DEEP_PATTERNS[2:5] if depth <= 4 else DEEP_PATTERNS[3:]
-    return {"text": generate_unique_question(user, pool), "keyboard": build_deep_keyboard()}
+    return {"text": generate_unique_question(user, pool, uid), "keyboard": build_deep_keyboard()}
 
 def handle_pni(user: dict, uid: int) -> dict:
     if not user.get("last_experience"):
@@ -469,7 +471,7 @@ def execute_message(uid: int, action: str, text: str) -> dict | None:
     if action == "start": return handle_start(user, uid)
     if action == "reset_state": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт."}
     if action == "reject_short": return handle_reject_short()
-    if action == "unified": return handle_unified(uid, user, text)
+    if action == "unified": return handle_unified(uid, text)
     return None
 
 def execute_callback(uid: int, action: str) -> dict | None:
@@ -507,7 +509,7 @@ def process_callback(chat_id: int, data: str) -> None:
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/12.2"
+    server_version = "ShamanBot/12.2.1"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -516,7 +518,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "12.2", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "12.2.1", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -573,7 +575,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v12.2 CLEAN on {HOST}:{PORT}")
+    log(f"ShamanBot v12.2.1 HOTFIX on {HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
