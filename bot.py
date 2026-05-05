@@ -734,9 +734,10 @@ def build_lenses_keyboard(category_id: str):
     return {"inline_keyboard": rows}
 
 def build_entry_keyboard():
+    """v14.4: кнопка «Посмотреть под другим углом» ведёт на категории, а не на все линзы"""
     return {"inline_keyboard": [
         [{"text": "✍️ Ответить и углубиться", "callback_data": "self_inquiry:answer"}],
-        [{"text": "🔍 Посмотреть под другим углом", "callback_data": "self_inquiry:lenses"}],
+        [{"text": "🔍 Посмотреть под другим углом", "callback_data": "mode:categories"}],
     ]}
 
 def build_full_lenses_keyboard():
@@ -766,7 +767,7 @@ def build_full_lenses_keyboard():
 def build_continue_keyboard():
     return {"inline_keyboard": [
         [{"text": "🕳 Продолжить глубже", "callback_data": "self_inquiry:deep"}],
-        [{"text": "🔍 Посмотреть через линзу", "callback_data": "self_inquiry:lenses"}],
+        [{"text": "🔍 Посмотреть через линзу", "callback_data": "mode:categories"}],
         [{"text": "🔄 Новый опыт", "callback_data": "reset"},
          {"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
@@ -1091,7 +1092,7 @@ def process_callback(chat_id: int, data: str) -> None:
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/14.3"
+    server_version = "ShamanBot/14.4"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -1100,7 +1101,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "14.3", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "14.4", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -1161,7 +1162,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v14.3 RUSSIAN on {HOST}:{PORT}")
+    log(f"ShamanBot v14.4 TWO-STEP on {HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
