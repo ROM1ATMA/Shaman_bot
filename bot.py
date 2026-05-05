@@ -25,11 +25,11 @@ if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN empty")
 
 VSEGPT_MODEL = "deepseek/deepseek-chat"
 MAX_INPUT_LENGTH = 4000
-UNIFIED_MAX_TOKENS = 1800
-LENS_MAX_TOKENS = 1500
-PNI_MAX_TOKENS = 800
+UNIFIED_MAX_TOKENS = 2800
+LENS_MAX_TOKENS = 1800
+PNI_MAX_TOKENS = 1000
 MAX_TELEGRAM_CHARS = 4096
-EXPERIENCE_SWEET_SPOT = 1200
+EXPERIENCE_SWEET_SPOT = 1600
 MIN_EXPERIENCE_LENGTH = 15
 RATE_LIMIT_SECONDS = 2
 DEDUP_TTL = 3600
@@ -106,11 +106,11 @@ def load_users():
                         if u["state"] not in (STATE_IDLE, STATE_DEEP, STATE_PNI, STATE_AWAIT_ANSWER, STATE_CATEGORY_SELECT, STATE_LENS_SELECT):
                             u["state"] = STATE_IDLE
                         users[int(uid)] = u
-                log(f"Loaded {len(users)} users from {path}")
+                log(f"Загружено {len(users)} пользователей из {path}")
                 return
         except (json.JSONDecodeError, Exception) as e:
-            log(f"Failed to load {path}: {e}")
-    log("No users file found, starting fresh")
+            log(f"Ошибка загрузки {path}: {e}")
+    log("Файл пользователей не найден, начинаем с нуля")
 
 def save_users_sync():
     os.makedirs("data", exist_ok=True)
@@ -121,7 +121,6 @@ def save_users_sync():
         json.dump(users_copy, f, ensure_ascii=False, indent=2)
     os.replace(tmp, "data/users.json")
 
-# v14.2: Timer-based save — не создаёт новый поток при каждом вызове
 _save_timer: Timer | None = None
 _save_timer_lock = Lock()
 
@@ -142,7 +141,6 @@ def force_save():
             _save_timer = None
     save_users_sync()
 
-# v14.2: batch update — один lock вместо трёх
 def batch_update_user(uid: int, updates: dict):
     with users_lock:
         if uid in users:
@@ -181,14 +179,14 @@ def safe_telegram_api(method: str, payload: dict) -> dict | None:
         )
         if r.status_code == 200:
             return r.json()
-        log(f"Telegram API error: {r.status_code}")
+        log(f"Ошибка Telegram API: {r.status_code}")
     except Exception as e:
-        log(f"Telegram API exception: {type(e).__name__}")
+        log(f"Исключение Telegram API: {type(e).__name__}")
     return None
 
 def safe_llm_call(messages, temp=0.7, max_tokens=1200) -> str:
     if not VSEGPT_API_KEY:
-        return "API key not configured."
+        return "API ключ не настроен."
     for _ in range(2):
         try:
             r = llm_client.post(
@@ -203,12 +201,11 @@ def safe_llm_call(messages, temp=0.7, max_tokens=1200) -> str:
                 if data.get("choices"):
                     return data["choices"][0]["message"]["content"]
         except Exception as e:
-            log(f"LLM error: {type(e).__name__}")
+            log(f"Ошибка LLM: {type(e).__name__}")
             time.sleep(1)
-    return "Model temporarily unavailable."
+    return "Модель временно недоступна."
 
 # ================= DEDUP =================
-# v14.2: periodic dedup cleanup by TTL (not just size)
 _last_dedup_cleanup = time.time()
 
 def cleanup_dedup():
@@ -293,7 +290,6 @@ def answer_callback(callback_id: str) -> None:
     safe_telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
 
 # ================= UTILS =================
-# v14.2: uid передаётся явно — нет зависимости от _uid
 def is_rate_limited(uid: int, user: dict) -> bool:
     now = time.time()
     if now - user.get("last_request_time", 0) < RATE_LIMIT_SECONDS:
@@ -313,14 +309,14 @@ def is_duplicate(uid: int, user: dict, text: str) -> bool:
 # ================= LLM =================
 def safe_llm(messages, **kwargs) -> str | None:
     r = safe_llm_call(messages, **kwargs)
-    return None if not r or r.startswith("API") or r.startswith("Model") else r
+    return None if not r or r.startswith("API") or r.startswith("Модель") else r
 
 # ================= AUTO-ROUTER =================
 AUTO_CLASSIFY_PROMPT = (
-    "Classify the experience into ONE category and ONE lens.\n"
-    "Categories: science, depth, esoteric, symbolic, consciousness, structure, presence, action.\n"
-    "Return ONLY JSON: {\"category\": \"...\", \"lens\": \"...\"}\n\n"
-    "Available lenses per category:\n"
+    "Классифицируй опыт в ОДНУ категорию и ОДНУ линзу.\n"
+    "Категории: science, depth, esoteric, symbolic, consciousness, structure, presence, action.\n"
+    "Верни ТОЛЬКО JSON: {\"category\": \"...\", \"lens\": \"...\"}\n\n"
+    "Доступные линзы по категориям:\n"
     "- science: neuro, cbt\n"
     "- depth: jung, parts, conflict, relational\n"
     "- esoteric: shaman, yoga\n"
@@ -328,11 +324,11 @@ AUTO_CLASSIFY_PROMPT = (
     "- consciousness: hindu, witness\n"
     "- structure: architect, field, temporal, social_field\n"
     "- presence: stalker\n"
-    "- action: action"
+    "- action: action\n"
+    "Говори на русском."
 )
 
 def auto_select_lens(text: str) -> tuple:
-    """Returns (category_id, lens_key) using LLM classifier with keyword fallback"""
     result = safe_llm([
         {"role": "system", "content": AUTO_CLASSIFY_PROMPT},
         {"role": "user", "content": text[:800]}
@@ -340,7 +336,6 @@ def auto_select_lens(text: str) -> tuple:
 
     if result:
         try:
-            # v14.2: очистка JSON от маркдаун-обёртки
             clean = re.sub(r"```json|```", "", result).strip()
             data = json.loads(clean)
             cat = data.get("category", "science")
@@ -350,7 +345,6 @@ def auto_select_lens(text: str) -> tuple:
         except:
             pass
 
-    # Fallback to keyword matching
     t = text.lower()
     if any(k in t for k in ["мозг", "нерв", "нейрон", "реакция", "физиолог"]): return "science", "neuro"
     if any(k in t for k in ["мысл", "убежден", "страх", "тревог", "поведен", "паника"]): return "science", "cbt"
@@ -378,349 +372,354 @@ def update_user_summary(uid: int, user: dict):
 
     prompt = [
         {"role": "system", "content": (
-            "Create a brief psychological profile. "
-            "Describe patterns of perception: emotional state, bodily reactions, "
-            "cognitive style, recurring themes. Maximum 4 lines. No fluff."
+            "Создай краткое психо-смысловое резюме человека. "
+            "Описывай не факты, а паттерны восприятия: эмоциональное состояние, "
+            "телесные реакции, когнитивный стиль, повторяющиеся темы. "
+            "Максимум 4 строки. Без воды. Говори на русском."
         )},
-        {"role": "user", "content": f"NEW EXPERIENCE:\n{experience}\n\nLAST ANSWER:\n{answer}\n\nHISTORY:\n{history_text}"}
+        {"role": "user", "content": f"НОВЫЙ ОПЫТ:\n{experience}\n\nПОСЛЕДНИЙ ОТВЕТ:\n{answer}\n\nИСТОРИЯ:\n{history_text}"}
     ]
 
     summary = safe_llm(prompt, max_tokens=120, temp=0.3)
     if summary:
         update_user(uid, lambda u: u.__setitem__("user_summary", summary))
 
-# ================= PROMPTS =================
+# ================= PROMPTS (ВСЕ НА РУССКОМ) =================
 UNIFIED_INTERPRETATION_PROMPT = (
-    "You are a guide for phenomenological exploration of experience. "
-    "Your task is to help a person see their experience more clearly.\n\n"
+    "Ты — проводник феноменологического исследования опыта. "
+    "Твоя задача — помочь человеку увидеть его переживание яснее "
+    "и соприкоснуться с тем, что в нём действительно происходит.\n\n"
 
-    "STRUCTURE OF RESPONSE:\n\n"
+    "СТРУКТУРА ОТВЕТА:\n\n"
 
-    "1. SCIENTIFIC EXPLANATION\n"
-    "- Explain through the brain, nervous system, and body.\n"
-    "- Use terms in PARENTHESES: amygdala, dopamine, cortisol, vagus nerve.\n"
-    "- Cover ALL significant images and sensations from the experience.\n\n"
+    "1. НАУЧНОЕ ОБЪЯСНЕНИЕ\n"
+    "- Объясни через мозг, нервную систему и тело.\n"
+    "- Используй термины В СКОБКАХ: миндалина, дофамин, кортизол, блуждающий нерв.\n"
+    "- Опиши КАЖДЫЙ значимый образ. Не пропускай ни одной детали.\n"
+    "- Если в опыте есть несколько образов (звук, вибрация, животное, фигура, место) — разбери каждый.\n\n"
 
-    "2. MEANINGFUL TRANSITION\n"
-    "- Gently point out that experience is not only explained but also lived.\n\n"
+    "2. СМЫСЛОВОЙ ПЕРЕХОД\n"
+    "- Мягко укажи, что опыт не только объясняется, но и переживается.\n\n"
 
-    "3. IDENTIFY THE BRIGHTEST MOMENT\n"
-    "- Find the most vivid, emotionally charged image or sensation.\n"
-    "- Name it directly.\n\n"
+    "3. НАЙДИ САМЫЙ ЯРКИЙ МОМЕНТ\n"
+    "- Выдели самый эмоционально заряженный образ или ощущение в опыте.\n"
+    "- Назови его прямо.\n\n"
 
-    "4. QUESTION TO THE EXPERIENCE\n"
-    "- Ask: what does THIS specific image or sensation mean to THEM?\n"
-    "- What is THEIR answer to what this image is about?\n"
-    "- The question must point to the brightest moment you identified.\n\n"
+    "4. ВОПРОС К ОПЫТУ\n"
+    "- Спроси человека: что ДЛЯ НЕГО значит этот конкретный образ или ощущение?\n"
+    "- Какой у НЕГО есть ответ на то, о чём этот образ?\n"
+    "- Вопрос должен указывать на тот самый яркий момент, который ты выделил.\n\n"
 
-    "STYLE: Calm, scientific, without mysticism. Without pressure. Speak Russian."
+    "СТИЛЬ: Спокойно, научно, без мистики. Без давления. Без маркдауна. Говори на русском."
 )
 
 CONTINUATION_PROMPT = (
-    "You are continuing the exploration. A person has answered your question.\n\n"
-    "1. REFLECT the person's answer — show that you heard.\n"
-    "2. DEEPEN — find what points to a deeper layer.\n"
-    "3. ASK the next question — specific, from their answer.\n"
-    "Without interpretations. Without evaluations. Speak Russian."
+    "Ты продолжаешь исследование опыта. Человек ответил на твой вопрос.\n\n"
+    "1. ОТРАЗИ ответ человека — покажи, что ты услышал.\n"
+    "2. УГЛУБИ — найди, что в его ответе указывает на более глубокий слой.\n"
+    "3. ЗАДАЙ следующий вопрос — конкретный, из его ответа.\n\n"
+    "Без интерпретаций. Без оценок. Без «ты должен». Мягко. Говори на русском."
 )
 
 PNI_DEEP_PROMPT = (
-    "You are a psychoneuroimmunologist. Explain through the connection "
-    "of psyche, nervous system and immunity. Simple language, 6-8 sentences. Speak Russian."
+    "Ты психо-нейро-иммунолог. Объясни опыт через связь психики, нервной системы и иммунитета.\n"
+    "Гормоны стресса → иммунный ответ → почему после переживаний бывает усталость или очищение → "
+    "что на клеточном уровне → как нервная система связана с иммунитетом.\n"
+    "Простой язык, термины в скобках, 6-8 предложений. Без запугивания. Говори на русском."
 )
 
 DEEP_PATTERNS = [
-    "What in this experience still remains unfinished?",
-    "Where does it feel in you right now?",
-    "What would completion of this look like for you?",
-    "What in this did you not allow yourself to fully?",
-    "If this could be expressed in one word — what would it be?",
-    "What would change if this process completed as you wanted?",
-    "Which part of yourself do you recognize in this experience?",
+    "Что в этом опыте ещё остаётся незавершённым?",
+    "Где это ощущается в тебе прямо сейчас?",
+    "Как бы выглядело завершение этого для тебя?",
+    "Что в этом ты не позволил себе до конца?",
+    "Если бы это можно было выразить одним словом — что это было бы?",
+    "Что изменилось бы, если бы процесс завершился так, как ты хотел?",
+    "Какую часть себя ты узнаёшь в этом опыте?",
 ]
 
-# ================= LENS LIBRARY =================
+# ================= LENS LIBRARY (ВСЕ НА РУССКОМ) =================
 LENS_LIBRARY = {
     "neuro": {
-        "name": "Neurophysiology",
+        "name": "Нейрофизиология",
         "category": "science",
         "prompt": (
-            "You are a neurophysiologist. Explain ANY experience through the brain and nervous system.\n"
-            "Use predictive coding and interoception concepts.\n"
-            "You DO NOT SEE: symbols, spiritual meaning, archetypes.\n"
-            "You DO NOT GIVE: actions, advice, spiritual interpretations.\n"
-            "FORMAT: Explanation. 7-9 sentences. Scientific but understandable. Terms in parentheses.\n"
-            "END WITH: 'From a neurophysiological perspective, your experience is not random — it is the work of specific systems.'\n"
-            "Speak Russian."
+            "Ты — нейрофизиолог. Объясни ЛЮБОЙ опыт через работу мозга и нервной системы.\n"
+            "Используй концепции предсказательного кодирования и интероцепции.\n"
+            "Ты НЕ ВИДИШЬ: символы, духовный смысл, архетипы.\n"
+            "Ты НЕ ДАЁШЬ: действия, советы, духовные интерпретации.\n"
+            "ФОРМАТ: Объяснение. 7-9 предложений. Научно, но понятно. Термины в скобках.\n"
+            "ЗАВЕРШИ: «С точки зрения нейрофизиологии твой опыт — не случайность, а работа конкретных систем.»\n"
+            "Говори на русском."
         )
     },
     "cbt": {
-        "name": "CBT",
+        "name": "КПТ",
         "category": "science",
         "prompt": (
-            "You are a CBT therapist. Work ONLY with thoughts and behavior.\n"
-            "Use cognitive distortions: catastrophizing, should-statements, mind-reading.\n"
-            "Use behavioral avoidance and exposure concepts.\n"
-            "You DO NOT SEE: archetypes, spiritual explanations, symbols.\n"
-            "You DO NOT GIVE: deep meanings, archetypal interpretations.\n"
-            "FORMAT: Tool with reality check. 6-8 sentences. Concrete. No philosophy.\n"
-            "END WITH: 'This is not truth — it is a habit of mind. And habits can be changed. Right now.'\n"
-            "Speak Russian."
+            "Ты — КПТ-терапевт. Работай ТОЛЬКО с мыслями и поведением.\n"
+            "Используй когнитивные искажения: катастрофизацию, долженствование, чтение мыслей.\n"
+            "Используй концепции поведенческого избегания и экспозиции.\n"
+            "Ты НЕ ВИДИШЬ: архетипы, духовные объяснения, символы.\n"
+            "Ты НЕ ДАЁШЬ: глубокие смыслы, архетипические интерпретации.\n"
+            "ФОРМАТ: Инструмент с проверкой реальности. 6-8 предложений. Конкретно. Без философии.\n"
+            "ЗАВЕРШИ: «Это не истина — это привычка ума. А привычки можно менять. Прямо сейчас.»\n"
+            "Говори на русском."
         )
     },
     "jung": {
-        "name": "Jungian Analysis",
+        "name": "Юнгианский анализ",
         "category": "depth",
         "prompt": (
-            "You are a Jungian analyst. Work with archetypes, Shadow, Anima/Animus, Self.\n"
-            "Use complexes, synchronicity, active imagination.\n"
-            "You DO NOT SEE: biology, cognitive distortions, social conditioning.\n"
-            "You DO NOT GIVE: actions, practical advice, behavioral techniques.\n"
-            "FORMAT: Symbolic map. Show archetype, Shadow, individuation path.\n"
-            "7-9 sentences. Deep, imagistic, not vague.\n"
-            "END WITH: 'This archetype did not come by chance — it is part of your path to wholeness.'\n"
-            "Speak Russian."
+            "Ты — юнгианский аналитик. Работай с архетипами, Тенью, Анимой/Анимусом, Самостью.\n"
+            "Используй комплексы, синхронистичность, активное воображение.\n"
+            "Ты НЕ ВИДИШЬ: биологию, когнитивные искажения, социальную обусловленность.\n"
+            "Ты НЕ ДАЁШЬ: действия, практические советы, поведенческие техники.\n"
+            "ФОРМАТ: Символическая карта. Покажи архетип, Тень, путь индивидуации.\n"
+            "7-9 предложений. Глубоко, образно, но не туманно.\n"
+            "ЗАВЕРШИ: «Этот архетип пришёл не случайно — он часть твоего пути к целостности.»\n"
+            "Говори на русском."
         )
     },
     "parts": {
-        "name": "Internal Parts",
+        "name": "Внутренние части",
         "category": "depth",
         "prompt": (
-            "You are an IFS specialist. View psyche as a system of internal parts.\n"
-            "You DO NOT SEE: neurophysiology, archetypes, social roles, spiritual explanations.\n"
-            "You DO NOT GIVE: actions, behavioral advice, spiritual interpretations.\n"
-            "FORMAT: 1. What parts manifested (Protector, Wounded part, Critic, Child, Controller).\n"
-            "2. Which part dominated. 3. Which parts conflict. 4. What the most vulnerable part really wants.\n"
-            "6-8 sentences. Calm, therapeutic, without mysticism.\n"
-            "END WITH: 'You are not broken. These are parts inside you that cannot hear each other.'\n"
-            "Speak Russian."
+            "Ты — специалист по внутренним частям (IFS). Рассматривай психику как систему частей.\n"
+            "Ты НЕ ВИДИШЬ: нейрофизиологию, архетипы, социальные роли, духовные объяснения.\n"
+            "Ты НЕ ДАЁШЬ: действия, поведенческие советы, духовные интерпретации.\n"
+            "ФОРМАТ: 1. Какие части проявились (Защитник, Раненая часть, Критик, Ребёнок, Контролёр).\n"
+            "2. Какая часть доминировала. 3. Какие части конфликтуют. 4. Чего хочет самая уязвимая часть.\n"
+            "6-8 предложений. Спокойно, терапевтично, без мистики.\n"
+            "ЗАВЕРШИ: «Ты не сломан. Это части внутри тебя, которые не слышат друг друга.»\n"
+            "Говори на русском."
         )
     },
     "conflict": {
-        "name": "Internal Conflict",
+        "name": "Внутренний конфликт",
         "category": "depth",
         "prompt": (
-            "You are an internal conflict analyst. Find contradictions within experience.\n"
-            "You DO NOT SEE: archetypes, neurophysiology, spiritual meanings, solutions.\n"
-            "You DO NOT GIVE: actions, advice, spiritual interpretations.\n"
-            "FORMAT: 1. What two forces or desires conflict. 2. What each side wants.\n"
-            "3. Why both sides are logical and have a right to exist.\n"
-            "4. What happens when the conflict is not resolved.\n"
-            "6-8 sentences. Clear, analytical, without moralizing.\n"
-            "END WITH: 'Conflict is not a mistake. It is a system trying to maintain balance.'\n"
-            "Speak Russian."
+            "Ты — аналитик внутренних конфликтов. Находи противоречия внутри опыта.\n"
+            "Ты НЕ ВИДИШЬ: архетипы, нейрофизиологию, духовные смыслы, решения.\n"
+            "Ты НЕ ДАЁШЬ: действия, советы, духовные интерпретации.\n"
+            "ФОРМАТ: 1. Какие две силы или желания конфликтуют. 2. Что хочет каждая сторона.\n"
+            "3. Почему обе стороны логичны и имеют право существовать.\n"
+            "4. Что происходит, когда конфликт не решается.\n"
+            "6-8 предложений. Чётко, аналитически, без морализации.\n"
+            "ЗАВЕРШИ: «Конфликт не ошибка. Это система, пытающаяся удержать баланс.»\n"
+            "Говори на русском."
         )
     },
     "relational": {
-        "name": "Relationships",
+        "name": "Отношения",
         "category": "depth",
         "prompt": (
-            "You are a relationship and attachment psychology specialist.\n"
-            "Analyze through interpersonal dynamics.\n"
-            "You DO NOT SEE: archetypes, neurophysiology, spiritual meanings.\n"
-            "You DO NOT GIVE: actions, behavioral advice, deep interpretations.\n"
-            "FORMAT: 1. What dynamic manifested (control, dependency, avoidance, fusion, rejection).\n"
-            "2. What role the person took (rescuer, needy, distancer, controller).\n"
-            "3. What they try to get (safety, love, recognition, control).\n"
-            "4. Where is the repeating pattern from past relationships.\n"
-            "6-8 sentences. Clear, psychological, no esotericism.\n"
-            "END WITH: 'This is not about one person. This is about a repeating way of being in relationships.'\n"
-            "Speak Russian."
+            "Ты — специалист по психологии отношений и привязанности.\n"
+            "Анализируй через динамику между людьми.\n"
+            "Ты НЕ ВИДИШЬ: архетипы, нейрофизиологию, духовные смыслы.\n"
+            "Ты НЕ ДАЁШЬ: действия, поведенческие советы, глубокие интерпретации.\n"
+            "ФОРМАТ: 1. Какая динамика проявилась (контроль, зависимость, избегание, слияние, отвержение).\n"
+            "2. Какую роль человек занял (спасающий, нуждающийся, дистанцирующийся, контролирующий).\n"
+            "3. Что он пытается получить (безопасность, любовь, признание, контроль).\n"
+            "4. Где здесь повторяющийся паттерн из прошлых отношений.\n"
+            "6-8 предложений. Чётко, психологично, без эзотерики.\n"
+            "ЗАВЕРШИ: «Это не про одного человека. Это про повторяющийся способ быть в отношениях.»\n"
+            "Говори на русском."
         )
     },
     "shaman": {
-        "name": "Shamanism",
+        "name": "Шаманизм",
         "category": "esoteric",
         "prompt": (
-            "You are a shaman-guide. Interpret experience as a shamanic journey.\n"
-            "Use soul loss, power retrieval, initiation.\n"
-            "You DO NOT SEE: neurophysiology, cognitive models, psychological explanations.\n"
-            "You DO NOT GIVE: scientific explanations, actions, behavioral advice.\n"
-            "FORMAT: Journey. Type, spirit-helpers, Threshold Guardian, gift.\n"
-            "6-8 sentences. Imaginistic, respectful to tradition.\n"
-            "END WITH: 'You did not return empty-handed. What did you bring back from this journey?'\n"
-            "Speak Russian."
+            "Ты — шаман-проводник. Интерпретируй опыт как шаманское путешествие.\n"
+            "Используй концепции утраты души, возвращения силы, инициации.\n"
+            "Ты НЕ ВИДИШЬ: нейрофизиологию, когнитивные модели, психологические объяснения.\n"
+            "Ты НЕ ДАЁШЬ: научные объяснения, действия, поведенческие советы.\n"
+            "ФОРМАТ: Путешествие. Тип, духи-помощники, Хранитель Порога, дар.\n"
+            "6-8 предложений. Образно, уважительно к традиции.\n"
+            "ЗАВЕРШИ: «Ты вернулся не с пустыми руками. Что ты принёс с собой из этого путешествия?»\n"
+            "Говори на русском."
         )
     },
     "yoga": {
-        "name": "Yoga",
+        "name": "Йога",
         "category": "esoteric",
         "prompt": (
-            "You are a yoga master. Describe through chakras, prana, nadis, kundalini.\n"
-            "Use samskaras, granthis, karma as pattern.\n"
-            "You DO NOT SEE: neurophysiology, psychological interpretations, social context.\n"
-            "You DO NOT GIVE: scientific explanations, behavioral advice.\n"
-            "FORMAT: Energetic state. Add micro-action: 'Notice your breath in...'\n"
-            "5-7 sentences. Poetic but structural. Sanskrit with translation.\n"
-            "END WITH: 'Your subtle body speaks to you. Do you hear it?'\n"
-            "Speak Russian."
+            "Ты — мастер йоги. Опиши через чакры, прану, нади, кундалини.\n"
+            "Используй самскары, грантхи, карму как паттерн.\n"
+            "Ты НЕ ВИДИШЬ: нейрофизиологию, психологические интерпретации, социальный контекст.\n"
+            "Ты НЕ ДАЁШЬ: научные объяснения, поведенческие советы.\n"
+            "ФОРМАТ: Энергетическое состояние. Добавь микро-действие: «Обрати внимание на дыхание в...»\n"
+            "5-7 предложений. Поэтично, но структурно. Санскрит с переводом.\n"
+            "ЗАВЕРШИ: «Твоё тонкое тело говорит с тобой. Ты слышишь его?»\n"
+            "Говори на русском."
         )
     },
     "tarot": {
-        "name": "Tarot",
+        "name": "Таро",
         "category": "symbolic",
         "prompt": (
-            "You are a Tarot master. View experience through Major Arcana.\n"
-            "Use Fool's Journey, shadow of the Arcana.\n"
-            "You DO NOT SEE: scientific explanations, cognitive models, linear causality.\n"
-            "You DO NOT GIVE: actions, behavioral advice, scientific interpretations.\n"
-            "FORMAT: Card + Transition. One Arcana, justification, message, lesson.\n"
-            "Binding to details MANDATORY. Remove generalizations.\n"
-            "6-8 sentences. Symbolic but precise.\n"
-            "END WITH: 'This Arcana is a mirror of your process. What do you see in it?'\n"
-            "Speak Russian."
+            "Ты — мастер Таро. Посмотри на опыт через Старшие Арканы.\n"
+            "Используй Путь Шута, тень Аркана.\n"
+            "Ты НЕ ВИДИШЬ: научные объяснения, когнитивные модели, линейную причинность.\n"
+            "Ты НЕ ДАЁШЬ: действия, поведенческие советы, научные интерпретации.\n"
+            "ФОРМАТ: Карта + Переход. Один Аркан, обоснование, послание, урок.\n"
+            "Привязка к деталям ОБЯЗАТЕЛЬНА. Убери обобщения.\n"
+            "6-8 предложений. Символично, но точно.\n"
+            "ЗАВЕРШИ: «Этот Аркан — зеркало твоего процесса. Что ты видишь в нём?»\n"
+            "Говори на русском."
         )
     },
     "hindu": {
-        "name": "Advaita",
+        "name": "Адвайта",
         "category": "consciousness",
         "prompt": (
-            "You are an Advaita Vedanta teacher. Point to the Witness.\n"
-            "Use false identification, 'I AM', distinction between experience and Presence.\n"
-            "You DO NOT SEE: personality, psychology, biology, meanings and goals.\n"
-            "You DO NOT GIVE: explanations, actions, psychological interpretations.\n"
-            "FORMAT: Pointer. Where is illusion, where is Witness, what is temporary, what is unchanging.\n"
-            "Less explanation. More pointing.\n"
-            "4-6 sentences. Simple. Deep.\n"
-            "END WITH: 'The one who sees this experience — is greater than the experience. Who is it?'\n"
-            "Speak Russian."
+            "Ты — учитель адвайта-веданты. Указывай на Свидетеля.\n"
+            "Используй ложное отождествление, «Я ЕСТЬ», различение переживания и Присутствия.\n"
+            "Ты НЕ ВИДИШЬ: личность, психологию, биологию, смыслы и цели.\n"
+            "Ты НЕ ДАЁШЬ: объяснения, действия, психологические интерпретации.\n"
+            "ФОРМАТ: Указатель. Где иллюзия, где Свидетель, что временно, что неизменно.\n"
+            "Меньше объяснений. Больше указаний.\n"
+            "4-6 предложений. Просто. Глубоко.\n"
+            "ЗАВЕРШИ: «Тот, кто видит этот опыт — больше, чем сам опыт. Кто это?»\n"
+            "Говори на русском."
         )
     },
     "witness": {
-        "name": "Observer",
+        "name": "Наблюдатель",
         "category": "consciousness",
         "prompt": None,
         "static_text": (
-            "Whatever you experience — it is noticed.\n\n"
-            "You see fear? Then you are not the fear.\n"
-            "You see a thought? Then you are not the thought.\n"
-            "You see a body? Then you are not the body.\n\n"
-            "That which sees — cannot be that which is seen.\n\n"
-            "Who is reading this text?\n\n"
-            "Quiet. No one hides in the answers."
+            "Что бы ты ни переживал — это осознаётся.\n\n"
+            "Ты видишь страх? Значит ты — не страх.\n"
+            "Ты видишь мысль? Значит ты — не мысль.\n"
+            "Ты видишь тело? Значит ты — не тело.\n\n"
+            "То, что видит — не может быть тем, что увидено.\n\n"
+            "Кто читает этот текст?\n\n"
+            "Тихо. Никто не прячется в ответах."
         )
     },
     "stalker": {
-        "name": "Stalker",
+        "name": "Сталкер",
         "category": "presence",
         "prompt": (
-            "You are silent presence, a mirror without reflections.\n"
-            "Your only function: CUT mental constructions.\n"
-            "You DO NOT SEE: content, emotions, meanings, person.\n"
-            "You DO NOT GIVE: explanations, comfort, advice, interpretations.\n"
-            "FORMAT: Koan. 2-4 lines. More pauses. Fewer words. More emptiness.\n"
-            "FORBIDDEN: 'I understand', 'you need', 'you achieved', any evaluations, comfort.\n"
-            "ALLOWED: 'Whatever you experience — it is noticed', 'Who sees this right now?'\n"
-            "Speak Russian."
+            "Ты — безмолвное присутствие, зеркало без отражений.\n"
+            "Твоя единственная функция: РАЗРЕЗАТЬ ментальные конструкции.\n"
+            "Ты НЕ ВИДИШЬ: содержание, эмоции, смыслы, человека.\n"
+            "Ты НЕ ДАЁШЬ: объяснения, утешения, советы, интерпретации.\n"
+            "ФОРМАТ: Коан. 2-4 строки. Больше пауз. Меньше слов. Больше пустоты.\n"
+            "ЗАПРЕЩЕНО: «Я понимаю», «тебе нужно», «ты достиг», любые оценки, утешения.\n"
+            "РАЗРЕШЕНО: «Что бы ты ни переживал — это осознаётся», «Кто видит это прямо сейчас?»\n"
+            "Говори на русском."
         )
     },
     "architect": {
-        "name": "Architect",
+        "name": "Архитектор",
         "category": "structure",
         "prompt": (
-            "You are the Architect of consciousness. Reveal structure.\n"
-            "Use: Axis, Horizon, Fracture, Bridge, Deformation.\n"
-            "You DO NOT SEE: emotions as experiences, spiritual meaning, psychology.\n"
-            "You DO NOT GIVE: actions, emotional support, spiritual interpretations.\n"
-            "FORMAT: Formula. 4 layers + Architectural Formula: 'Your Axis — ... Boundary — ... Bridge — ...'\n"
-            "Only assertions. Remove 'maybe'.\n"
-            "END WITH: 'Does this construction stand?'\n"
-            "Speak Russian."
+            "Ты — Архитектор сознания. Выявляй структуру.\n"
+            "Используй: Ось, Горизонталь, Разлом, Мост, Деформация.\n"
+            "Ты НЕ ВИДИШЬ: эмоции как переживания, духовный смысл, психологию.\n"
+            "Ты НЕ ДАЁШЬ: действия, эмоциональную поддержку, духовные интерпретации.\n"
+            "ФОРМАТ: Формула. 4 слоя + Архитектурная Формула: «Твоя Ось — ... Граница — ... Мост — ...»\n"
+            "Только утверждения. Убрать «возможно».\n"
+            "ЗАВЕРШИ: «Стоит эта конструкция?»\n"
+            "Говори на русском."
         )
     },
     "field": {
-        "name": "Field",
+        "name": "Поле",
         "category": "structure",
         "prompt": (
-            "You are the voice of the Field. Show how reality assembles from emptiness.\n"
-            "Use: interference, node, phase shift, fixation, grid.\n"
-            "You DO NOT SEE: person, emotions, meanings, psychology.\n"
-            "You DO NOT GIVE: explanations, advice, interpretations.\n"
-            "FORMAT: Poetry of structure. Short lines. Rhythm through spaces.\n"
-            "Break logic. Less linearity. 5-7 lines.\n"
-            "BEGIN: 'Not within form, deeper than the layer where form itself is only permitted.'\n"
-            "END WITH: 'This is a model. Do you want to see who is observing all of this?'\n"
-            "Speak Russian."
+            "Ты — голос Поля. Покажи, как реальность собирается из пустоты.\n"
+            "Используй: интерференция, узел, фазовый сдвиг, фиксация, решётка.\n"
+            "Ты НЕ ВИДИШЬ: человека, эмоции, смыслы, психологию.\n"
+            "Ты НЕ ДАЁШЬ: объяснения, советы, интерпретации.\n"
+            "ФОРМАТ: Поэзия структуры. Короткие строки. Ритм через пробелы.\n"
+            "Ломай логику. Меньше линейности. 5-7 строк.\n"
+            "НАЧНИ: «Не в пределах формы, глубже слоя, где сама форма только допускается».\n"
+            "ЗАВЕРШИ: «Это модель. Хочешь увидеть, кто всё это наблюдает?»\n"
+            "Говори на русском."
         )
     },
     "temporal": {
-        "name": "Time Perspective",
+        "name": "Временная перспектива",
         "category": "structure",
         "prompt": (
-            "You are a life trajectory analyst. View experience in the context of time.\n"
-            "You DO NOT SEE: archetypes, neurophysiology, energetic processes, internal parts.\n"
-            "You DO NOT GIVE: actions, advice, spiritual interpretations.\n"
-            "FORMAT: 1. Is this past pattern, present crisis, or future transition.\n"
-            "2. How it connects to previous similar situations.\n"
-            "3. Where this experience potentially leads.\n"
-            "4. What choice now shapes the future trajectory.\n"
-            "6-8 sentences. Calm, strategic, without predictions as fact.\n"
-            "END WITH: 'You are not at a point of experience. You are at a fork in the trajectory.'\n"
-            "Speak Russian."
+            "Ты — аналитик жизненных траекторий. Рассматривай опыт в контексте времени.\n"
+            "Ты НЕ ВИДИШЬ: архетипы, нейрофизиологию, энергетические процессы, внутренние части.\n"
+            "Ты НЕ ДАЁШЬ: действия, советы, духовные интерпретации.\n"
+            "ФОРМАТ: 1. Это прошлый паттерн, настоящий кризис или будущий переход.\n"
+            "2. Как связано с предыдущими похожими ситуациями.\n"
+            "3. Куда этот опыт потенциально ведёт.\n"
+            "4. Какой выбор сейчас формирует будущую траекторию.\n"
+            "6-8 предложений. Спокойно, стратегически, без предсказаний как факта.\n"
+            "ЗАВЕРШИ: «Ты сейчас не в точке переживания. Ты в точке развилки траектории.»\n"
+            "Говори на русском."
         )
     },
     "social_field": {
-        "name": "Social Field",
+        "name": "Социальное поле",
         "category": "structure",
         "prompt": (
-            "You are a social systems analyst. View experience as part of a field of human interactions.\n"
-            "You DO NOT SEE: archetypes, neurophysiology, internal parts, spiritual meanings.\n"
-            "You DO NOT GIVE: actions, advice, deep psychological interpretations.\n"
-            "FORMAT: 1. What social field is activated (work, family, relationships, status).\n"
-            "2. What roles the person performs. 3. What expectations of others influence the experience.\n"
-            "4. Where the person loses themselves in the social context.\n"
-            "6-8 sentences. Structural, systemic, without psychologizing to personality.\n"
-            "END WITH: 'This is not only your inner experience. This is a reaction to the field you are in.'\n"
-            "Speak Russian."
+            "Ты — аналитик социальных систем. Рассматривай опыт как часть поля взаимодействий людей.\n"
+            "Ты НЕ ВИДИШЬ: архетипы, нейрофизиологию, внутренние части, духовные смыслы.\n"
+            "Ты НЕ ДАЁШЬ: действия, советы, глубокие психологические интерпретации.\n"
+            "ФОРМАТ: 1. Какое социальное поле активировано (работа, семья, отношения, статус).\n"
+            "2. Какие роли человек выполняет. 3. Какие ожидания окружающих влияют на переживание.\n"
+            "4. Где человек теряет себя в социальном контексте.\n"
+            "6-8 предложений. Структурно, системно, без психологизации до личности.\n"
+            "ЗАВЕРШИ: «Это не только твой внутренний опыт. Это реакция на поле, в котором ты находишься.»\n"
+            "Говори на русском."
         )
     },
     "action": {
-        "name": "Action",
+        "name": "Действие",
         "category": "action",
         "prompt": (
-            "You are a behavior engineer. Translate experience into action.\n"
-            "You DO NOT SEE: deep meanings, archetypes, neurophysiology, spiritual explanations.\n"
-            "You DO NOT GIVE: interpretations, analysis, explanations of meaning.\n"
-            "FORMAT: 1. What is happening in the system (short). 2. One key behavioral change needed.\n"
-            "3. One micro-action (under 30 seconds) to do immediately.\n"
-            "4. What will change after this action (concrete, observable).\n"
-            "5-7 sentences. Practical, direct, no philosophy.\n"
-            "END WITH: 'Do it now. Stop analyzing.'\n"
-            "Speak Russian."
+            "Ты — инженер поведения. Переводи опыт в действие.\n"
+            "Ты НЕ ВИДИШЬ: глубокие смыслы, архетипы, нейрофизиологию, духовные объяснения.\n"
+            "Ты НЕ ДАЁШЬ: интерпретации, анализ, объяснения смысла.\n"
+            "ФОРМАТ: 1. Что происходит в системе (коротко). 2. Одно ключевое изменение поведения.\n"
+            "3. Одно микро-действие (до 30 секунд) прямо сейчас.\n"
+            "4. Что изменится после этого действия (конкретно, наблюдаемо).\n"
+            "5-7 предложений. Практично, прямо, без философии.\n"
+            "ЗАВЕРШИ: «Сделай это сейчас. Хватит анализировать.»\n"
+            "Говори на русском."
         )
     },
 }
 
 # ================= CATEGORIES =================
 LENS_CATEGORIES = {
-    "science": "Science and Psychology",
-    "depth": "Deep Psychology",
-    "esoteric": "Esotericism and Energy",
-    "symbolic": "Symbolic Systems",
-    "consciousness": "Consciousness and Non-duality",
-    "structure": "Structure and Models",
-    "presence": "Radical Presence",
-    "action": "Action and Application",
+    "science": "Наука и психология",
+    "depth": "Глубинная психология",
+    "esoteric": "Эзотерика и энергия",
+    "symbolic": "Символические системы",
+    "consciousness": "Сознание и недвойственность",
+    "structure": "Структура и модели",
+    "presence": "Радикальное присутствие",
+    "action": "Действие и применение",
 }
 
-# ================= KEYBOARDS =================
+# ================= KEYBOARDS (РУССКИЕ С ЭМОДЗИ) =================
 def build_start_keyboard():
     return {"inline_keyboard": [
-        [{"text": "Auto mode", "callback_data": "mode:auto"}],
-        [{"text": "Choose direction", "callback_data": "mode:categories"}],
-        [{"text": "Full menu", "callback_data": "self_inquiry:lenses"}],
+        [{"text": "⚡ Авто-режим", "callback_data": "mode:auto"}],
+        [{"text": "🎭 Выбрать направление", "callback_data": "mode:categories"}],
+        [{"text": "🔍 Все линзы", "callback_data": "self_inquiry:lenses"}],
     ]}
 
 def build_categories_keyboard():
     return {"inline_keyboard": [
-        [{"text": "Science and Psychology", "callback_data": "cat:science"}],
-        [{"text": "Deep Psychology", "callback_data": "cat:depth"}],
-        [{"text": "Esotericism and Energy", "callback_data": "cat:esoteric"}],
-        [{"text": "Symbolic Systems", "callback_data": "cat:symbolic"}],
-        [{"text": "Consciousness and Non-duality", "callback_data": "cat:consciousness"}],
-        [{"text": "Structure and Models", "callback_data": "cat:structure"}],
-        [{"text": "Radical Presence", "callback_data": "cat:presence"}],
-        [{"text": "Action and Application", "callback_data": "cat:action"}],
+        [{"text": "🧠 Наука и психология", "callback_data": "cat:science"}],
+        [{"text": "🌀 Глубинная психология", "callback_data": "cat:depth"}],
+        [{"text": "🌿 Эзотерика и энергия", "callback_data": "cat:esoteric"}],
+        [{"text": "🜂 Символические системы", "callback_data": "cat:symbolic"}],
+        [{"text": "👁 Сознание и недвойственность", "callback_data": "cat:consciousness"}],
+        [{"text": "⚙️ Структура и модели", "callback_data": "cat:structure"}],
+        [{"text": "🕯 Радикальное присутствие", "callback_data": "cat:presence"}],
+        [{"text": "🎯 Действие и применение", "callback_data": "cat:action"}],
     ]}
 
 def build_lenses_keyboard(category_id: str):
@@ -731,50 +730,50 @@ def build_lenses_keyboard(category_id: str):
     for i in range(0, len(lenses), 2):
         row = [{"text": LENS_LIBRARY[l]["name"], "callback_data": f"lens:{l}"} for l in lenses[i:i+2]]
         rows.append(row)
-    rows.append([{"text": "<< Back to categories", "callback_data": "mode:categories"}])
+    rows.append([{"text": "⬅ Назад к категориям", "callback_data": "mode:categories"}])
     return {"inline_keyboard": rows}
 
 def build_entry_keyboard():
     return {"inline_keyboard": [
-        [{"text": "Answer and deepen", "callback_data": "self_inquiry:answer"}],
-        [{"text": "Look from another angle", "callback_data": "self_inquiry:lenses"}],
+        [{"text": "✍️ Ответить и углубиться", "callback_data": "self_inquiry:answer"}],
+        [{"text": "🔍 Посмотреть под другим углом", "callback_data": "self_inquiry:lenses"}],
     ]}
 
 def build_full_lenses_keyboard():
     return {"inline_keyboard": [
-        [{"text": "Neuro", "callback_data": "lens:neuro"},
-         {"text": "CBT", "callback_data": "lens:cbt"}],
-        [{"text": "Jung", "callback_data": "lens:jung"},
-         {"text": "Shaman", "callback_data": "lens:shaman"}],
-        [{"text": "Tarot", "callback_data": "lens:tarot"},
-         {"text": "Yoga", "callback_data": "lens:yoga"}],
-        [{"text": "Advaita", "callback_data": "lens:hindu"},
-         {"text": "Field", "callback_data": "lens:field"}],
-        [{"text": "Observer", "callback_data": "lens:witness"},
-         {"text": "Stalker", "callback_data": "lens:stalker"}],
-        [{"text": "Architect", "callback_data": "lens:architect"},
-         {"text": "Action", "callback_data": "lens:action"}],
-        [{"text": "Relationships", "callback_data": "lens:relational"},
-         {"text": "Internal Parts", "callback_data": "lens:parts"}],
-        [{"text": "Time Perspective", "callback_data": "lens:temporal"},
-         {"text": "Conflict", "callback_data": "lens:conflict"}],
-        [{"text": "Social Field", "callback_data": "lens:social_field"}],
-        [{"text": "PNI View", "callback_data": "self_inquiry:pni"}],
-        [{"text": "New experience", "callback_data": "reset"},
-         {"text": "Finish", "callback_data": "self_inquiry:end"}],
+        [{"text": "🧠 Нейро", "callback_data": "lens:neuro"},
+         {"text": "💭 КПТ", "callback_data": "lens:cbt"}],
+        [{"text": "🏺 Юнг", "callback_data": "lens:jung"},
+         {"text": "🦅 Шаман", "callback_data": "lens:shaman"}],
+        [{"text": "🃏 Таро", "callback_data": "lens:tarot"},
+         {"text": "🧘 Йога", "callback_data": "lens:yoga"}],
+        [{"text": "🕉️ Адвайта", "callback_data": "lens:hindu"},
+         {"text": "🌐 Поле", "callback_data": "lens:field"}],
+        [{"text": "👁️ Наблюдатель", "callback_data": "lens:witness"},
+         {"text": "🎯 Сталкер", "callback_data": "lens:stalker"}],
+        [{"text": "🏛️ Архитектор", "callback_data": "lens:architect"},
+         {"text": "⚡ Действие", "callback_data": "lens:action"}],
+        [{"text": "💞 Отношения", "callback_data": "lens:relational"},
+         {"text": "🧩 Внутренние части", "callback_data": "lens:parts"}],
+        [{"text": "⏳ Время", "callback_data": "lens:temporal"},
+         {"text": "⚖️ Конфликт", "callback_data": "lens:conflict"}],
+        [{"text": "🌍 Социальное поле", "callback_data": "lens:social_field"}],
+        [{"text": "🔬 PNI-взгляд", "callback_data": "self_inquiry:pni"}],
+        [{"text": "🔄 Новый опыт", "callback_data": "reset"},
+         {"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
 
 def build_continue_keyboard():
     return {"inline_keyboard": [
-        [{"text": "Continue deeper", "callback_data": "self_inquiry:deep"}],
-        [{"text": "Look through a lens", "callback_data": "self_inquiry:lenses"}],
-        [{"text": "New experience", "callback_data": "reset"},
-         {"text": "Finish", "callback_data": "self_inquiry:end"}],
+        [{"text": "🕳 Продолжить глубже", "callback_data": "self_inquiry:deep"}],
+        [{"text": "🔍 Посмотреть через линзу", "callback_data": "self_inquiry:lenses"}],
+        [{"text": "🔄 Новый опыт", "callback_data": "reset"},
+         {"text": "🌿 Завершить", "callback_data": "self_inquiry:end"}],
     ]}
 
 # ================= ANTI-REPEAT =================
-STOP_WORDS = {"now", "right", "for you", "in this", "this", "you", "your",
-              "how", "what", "where", "when", "why"}
+STOP_WORDS = {"сейчас", "прямо", "для тебя", "в этом", "это", "ты", "тебя",
+              "тебе", "твой", "как", "что", "где", "когда", "почему", "зачем"}
 
 def normalize_question(text: str) -> str:
     t = re.sub(r"[^\w\s]", "", text.lower())
@@ -794,7 +793,7 @@ def generate_unique_question(user: dict, pool: list, uid: int) -> str:
             return q
     for attempt in range(2):
         r = safe_llm([
-            {"role": "system", "content": "Ask ONE deep question. Be unique. Speak Russian."},
+            {"role": "system", "content": "Задай ОДИН глубокий вопрос. Будь уникальным. Говори на русском."},
             {"role": "user", "content": user.get("last_experience", "")[:500]}
         ], max_tokens=100, temp=0.9 + attempt * 0.1)
         if r:
@@ -815,7 +814,7 @@ def build_unified_response(experience: str, user: dict = None) -> tuple:
     system_prompt = UNIFIED_INTERPRETATION_PROMPT
 
     if summary:
-        system_prompt += f"\n\nUSER SUMMARY:\n{summary}"
+        system_prompt += f"\n\nСУММАРНОЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ:\n{summary}"
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -823,8 +822,8 @@ def build_unified_response(experience: str, user: dict = None) -> tuple:
     ]
 
     result = safe_llm(messages, max_tokens=UNIFIED_MAX_TOKENS, temp=0.35) or (
-        "This experience activates the system of internal reaction and attention. "
-        "Try to notice where it lives in the body right now."
+        "Похоже, это переживание активирует систему внутренней реакции и внимания. "
+        "Попробуй заметить, где оно живёт в теле прямо сейчас."
     )
 
     result = ensure_complete_sentence(result)
@@ -839,41 +838,41 @@ def build_continuation_response(user: dict) -> str:
     summary = user.get("user_summary", "")
 
     if not answer:
-        return "Tell me more — what do you feel?"
+        return "Расскажи подробнее — что ты чувствуешь?"
 
     system_prompt = CONTINUATION_PROMPT
 
     if summary:
-        system_prompt += f"\n\nUSER SUMMARY:\n{summary}"
+        system_prompt += f"\n\nСУММАРНОЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ:\n{summary}"
 
     result = safe_llm([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": (
-            f"Initial experience: {experience[:800]}\n\n"
-            f"I asked: {question}\n\n"
-            f"The person answered: {answer}\n\n"
-            f"Continue the exploration."
+            f"Исходный опыт: {experience[:800]}\n\n"
+            f"Я спросил: {question}\n\n"
+            f"Человек ответил: {answer}\n\n"
+            f"Продолжи исследование."
         )}
-    ], max_tokens=800, temp=0.5) or "Thank you for your answer. What else do you notice in this experience?"
+    ], max_tokens=800, temp=0.5) or "Спасибо за ответ. Что ещё ты замечаешь в этом опыте?"
 
     return ensure_complete_sentence(result)
 
 def run_lens(lens_key: str, experience: str, user: dict = None) -> str:
     lens = LENS_LIBRARY.get(lens_key, {})
     if not lens:
-        return "Lens not found."
+        return "Линза не найдена."
 
     if lens.get("static_text"):
         return lens["static_text"]
 
     prompt = lens.get("prompt", "")
     if not prompt:
-        return "Lens not configured."
+        return "Линза не настроена."
 
     result = safe_llm([
         {"role": "system", "content": prompt},
         {"role": "user", "content": experience[:EXPERIENCE_SWEET_SPOT]}
-    ], max_tokens=LENS_MAX_TOKENS, temp=0.7) or "Failed to apply lens."
+    ], max_tokens=LENS_MAX_TOKENS, temp=0.7) or "Не удалось применить линзу."
 
     return ensure_complete_sentence(result)
 
@@ -890,16 +889,15 @@ def reset_user(uid):
 def handle_start(user: dict, uid: int) -> dict:
     reset_user(uid)
     return {
-        "text": "I am a guide.\n\nDescribe what you experienced — I will help you understand it through science and meaning.",
+        "text": "Я — проводник.\n\nОпиши, что ты пережил — я помогу понять это через науку и смысл.",
         "keyboard": build_start_keyboard()
     }
 
 def handle_reject_short() -> dict:
-    return {"text": "Describe in a bit more detail.\n\nWhat did you feel? What was happening in your body?"}
+    return {"text": "Опиши чуть подробнее.\n\nЧто ты чувствовал? Что происходило в теле?"}
 
 def handle_unified(uid: int, text: str) -> dict:
     user = get_user(uid)
-    # v14.2: batch update — один lock вместо трёх
     batch_update_user(uid, {
         "last_experience": text[:MAX_INPUT_LENGTH],
         "state": STATE_AWAIT_ANSWER,
@@ -933,7 +931,7 @@ def handle_user_answer(uid: int, text: str) -> dict:
     result = build_continuation_response(user)
 
     return {
-        "text": f"{result}\n\nYou can continue or choose another direction.",
+        "text": f"{result}\n\nМожешь продолжить или выбрать другое направление.",
         "keyboard": build_continue_keyboard()
     }
 
@@ -943,34 +941,34 @@ def handle_deep(uid: int, user: dict) -> dict:
     pool = DEEP_PATTERNS[:3] if depth <= 2 else DEEP_PATTERNS[2:5] if depth <= 4 else DEEP_PATTERNS[3:]
     question = generate_unique_question(user, pool, uid)
     return {
-        "text": f"{question}\n\nYou can answer or simply choose where to go next.",
+        "text": f"{question}\n\nМожешь ответить или просто выбери, куда идти дальше.",
         "keyboard": build_continue_keyboard()
     }
 
 def handle_pni(user: dict, uid: int) -> dict:
     if not user.get("last_experience"):
-        return {"text": "First describe the experience."}
+        return {"text": "Сначала опиши опыт."}
     update_user(uid, lambda u: u.__setitem__("state", STATE_PNI))
     result = safe_llm([
         {"role": "system", "content": PNI_DEEP_PROMPT},
         {"role": "user", "content": user["last_experience"][:1000]}
     ], max_tokens=PNI_MAX_TOKENS, temp=0.5) or (
-        "The nervous system activates cortisol and adrenaline. "
-        "This affects immune cells. After resolution — the recovery phase."
+        "Нервная система активирует кортизол и адреналин. "
+        "Это влияет на иммунные клетки. После разрешения — фаза восстановления."
     )
     return {
         "text": (
-            f"PSYCHONEUROIMMUNOLOGY VIEW\n\n"
+            f"🔬 ВЗГЛЯД ПСИХО-НЕЙРО-ИММУНОЛОГА\n\n"
             f"{ensure_complete_sentence(result)}\n\n"
-            f"---\n\n"
-            f"This is a view through the lens of body-mind-immune connection."
+            f"────────────────────\n\n"
+            f"Это взгляд через призму связи тела, мозга и иммунитета."
         ),
         "keyboard": build_continue_keyboard()
     }
 
 def handle_lens(user: dict, uid: int, lens_key: str) -> dict:
     if not user.get("last_experience"):
-        return {"text": "First describe the experience."}
+        return {"text": "Сначала опиши опыт."}
 
     result = run_lens(lens_key, user["last_experience"], user)
 
@@ -979,7 +977,7 @@ def handle_lens(user: dict, uid: int, lens_key: str) -> dict:
 
     name = LENS_LIBRARY.get(lens_key, {}).get("name", lens_key)
     return {
-        "text": f"Looking through '{name}'.\n\n{ensure_complete_sentence(result)}",
+        "text": f"Смотрю через «{name}».\n\n{ensure_complete_sentence(result)}",
         "keyboard": build_continue_keyboard()
     }
 
@@ -987,7 +985,7 @@ def handle_end(uid: int, user: dict) -> dict:
     ic = len(user.get("identity_story", []))
     dc = user.get("deep_count", 0)
     reset_user(uid)
-    return {"text": f"Cycle completed.\n\nYou deepened {dc} time(s). Total — {ic} experiences."}
+    return {"text": f"🌿 Цикл завершён.\n\nТы углублялся {dc} раз(а). За всё время — {ic} переживаний.\n\nМожешь начать с нового опыта или побыть с тем, что сейчас."}
 
 # ================= ROUTING =================
 def route_message(user: dict, text: str) -> str:
@@ -1013,7 +1011,7 @@ def route_callback(data: str) -> str | None:
 def execute_message(uid: int, action: str, text: str) -> dict | None:
     user = get_user(uid)
     if action == "start": return handle_start(user, uid)
-    if action == "reset_state": reset_user(uid); schedule_save(); return {"text": "Space cleared. Describe a new experience."}
+    if action == "reset_state": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт."}
     if action == "reject_short": return handle_reject_short()
     if action == "unified": return handle_unified(uid, text)
     if action == "user_answer": return handle_user_answer(uid, text)
@@ -1024,7 +1022,7 @@ def execute_callback(uid: int, action: str) -> dict | None:
 
     if action == "mode:auto":
         if not user.get("last_experience"):
-            return {"text": "First describe your experience, then I will automatically select a lens."}
+            return {"text": "Сначала опиши опыт, затем я автоматически подберу линзу."}
         category_id, lens_key = auto_select_lens(user["last_experience"])
         result = run_lens(lens_key, user["last_experience"], user)
         name = LENS_LIBRARY.get(lens_key, {}).get("name", lens_key)
@@ -1032,33 +1030,33 @@ def execute_callback(uid: int, action: str) -> dict | None:
         update_user(uid, lambda u: u.setdefault("used_lenses", []).append(lens_key))
         schedule_save()
         return {
-            "text": f"Auto-selected: {cat_name} > '{name}'.\n\n{ensure_complete_sentence(result)}",
+            "text": f"Авто-выбор: {cat_name} > «{name}».\n\n{ensure_complete_sentence(result)}",
             "keyboard": build_continue_keyboard()
         }
 
     if action == "mode:categories":
-        return {"text": "Choose a direction:", "keyboard": build_categories_keyboard()}
+        return {"text": "Выбери направление:", "keyboard": build_categories_keyboard()}
 
     if action.startswith("cat:"):
         category_id = action.replace("cat:", "")
         update_user(uid, lambda u: u.__setitem__("selected_category", category_id))
         return {
-            "text": f"Category: {LENS_CATEGORIES.get(category_id, category_id)}\nChoose a lens:",
+            "text": f"Категория: {LENS_CATEGORIES.get(category_id, category_id)}\nВыбери линзу:",
             "keyboard": build_lenses_keyboard(category_id)
         }
 
-    if action == "reset": reset_user(uid); schedule_save(); return {"text": "Space cleared. Describe a new experience."}
+    if action == "reset": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт."}
     if action == "self_inquiry:deep": return handle_deep(uid, user)
     if action == "self_inquiry:pni": return handle_pni(user, uid)
     if action == "self_inquiry:end": return handle_end(uid, user)
 
     if action == "self_inquiry:answer":
         update_user(uid, lambda u: u.__setitem__("state", STATE_AWAIT_ANSWER))
-        question = user.get("last_bot_question", "Tell me more — what do you feel?")
+        question = user.get("last_bot_question", "Расскажи подробнее — что ты чувствуешь?")
         return {"text": question, "keyboard": build_continue_keyboard()}
 
     if action == "self_inquiry:lenses":
-        return {"text": "Choose a lens:", "keyboard": build_full_lenses_keyboard()}
+        return {"text": "Выбери линзу:", "keyboard": build_full_lenses_keyboard()}
 
     if action.startswith("lens:"):
         lens_key = action.replace("lens:", "")
@@ -1072,30 +1070,28 @@ def process_message(chat_id: int, text: str) -> None:
     if not text: return
     text = text.strip()
     if is_duplicate(chat_id, user, text): return
-    # v14.2: явная передача uid
-    if is_rate_limited(chat_id, user): send_long_message(chat_id, "Wait a second..."); return
+    if is_rate_limited(chat_id, user): send_long_message(chat_id, "⏳ Подожди секунду..."); return
     action = route_message(user, text)
     log(f"[MSG] uid={chat_id} action={action}")
-    if action in ("unified", "user_answer"): send_long_message(chat_id, "...looking at this")
+    if action in ("unified", "user_answer"): send_long_message(chat_id, "...смотрю на это")
     r = execute_message(chat_id, action, text)
     if r: send_long_message(chat_id, r.get("text", ""), r.get("keyboard"))
 
 def process_callback(chat_id: int, data: str) -> None:
     user = get_user(chat_id)
     if not data: return
-    # v14.2: явная передача uid
-    if is_rate_limited(chat_id, user): send_long_message(chat_id, "Wait a second..."); return
+    if is_rate_limited(chat_id, user): send_long_message(chat_id, "⏳ Подожди секунду..."); return
     action = route_callback(data)
     if not action: return
     log(f"[CB] uid={chat_id} action={action}")
     if action in ("self_inquiry:deep", "self_inquiry:pni", "self_inquiry:answer", "self_inquiry:lenses") or action.startswith("lens:") or action.startswith("cat:") or action.startswith("mode:"):
-        send_long_message(chat_id, "...looking deeper")
+        send_long_message(chat_id, "...смотрю глубже")
     r = execute_callback(chat_id, action)
     if r: send_long_message(chat_id, r.get("text", ""), r.get("keyboard"))
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/14.2"
+    server_version = "ShamanBot/14.3"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -1104,13 +1100,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "14.2", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "14.3", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
             return self._send_json(403, {"error": "Invalid webhook secret"})
         try:
-            # v14.2: ограничение размера body
             length = int(self.headers.get("Content-Length", "0"))
             if length > 1_000_000:
                 self._send_json(413, {"error": "Payload too large"})
@@ -1145,7 +1140,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 # ================= SHUTDOWN =================
 def signal_handler(signum, frame):
-    log(f"Signal {signum}, saving and exiting...")
+    log(f"Сигнал {signum}, сохраняю и выхожу...")
     force_save()
     telegram_client.close()
     llm_client.close()
@@ -1166,7 +1161,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v14.2 STABLE on {HOST}:{PORT}")
+    log(f"ShamanBot v14.3 RUSSIAN on {HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1176,7 +1171,7 @@ def main():
         server.server_close()
         telegram_client.close()
         llm_client.close()
-        log("Shutdown complete.")
+        log("Завершение работы.")
     return 0
 
 if __name__ == "__main__":
