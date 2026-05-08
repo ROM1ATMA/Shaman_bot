@@ -21,11 +21,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8080"))
 
-# 🔥 Твои ссылки
 YOUTUBE_URL = "https://youtube.com/@romanatma"
 TELEGRAM_CHANNEL_URL = "https://t.me/RomanAtma_ThroatSinging"
 INSTAGRAM_URL = "https://www.instagram.com/roman_atma"
-PAYMENT_LINK = os.getenv("PAYMENT_LINK", "https://your-payment-link")
 
 if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN empty")
 
@@ -54,17 +52,9 @@ MEDITATIONS = {
             "Это практика погружения в пространство, где звук становится порталом, "
             "а тело — проводником. Ты встретишься с тем, кто уже есть внутри тебя."
         ),
-        "type": "free",  # 🔥 Бесплатная
+        "type": "free",
         "file_id": "CQACAgIAAxkBAAFI0YRp-buxRWtPQuvzMR1XHbkJfOuXqQAC5WwAAr4wMUhaCLRUTVYNZzsE"
-    },
-    # 🔥 Будущие медитации — платные
-    # "entry_state": {
-    #     "title": "💠 Вход в состояние",
-    #     "description": "Практика глубокого погружения через звук и дыхание.",
-    #     "type": "paid",
-    #     "price": 490,
-    #     "file_id": "PASTE_FILE_ID"
-    # },
+    }
 }
 
 # ================= THREADING SERVER =================
@@ -89,24 +79,19 @@ STATE_AWAIT_ANSWER = "await_answer"
 STATE_DEEP = "deep"
 
 VALID_CALLBACKS = {
-    # Базовые
     "self_inquiry:deep", "self_inquiry:end", "self_inquiry:pni", "reset",
     "self_inquiry:answer", "self_inquiry:lenses",
-    # Режимы
     "mode:auto", "mode:categories",
-    # Категории
     "cat:science", "cat:depth", "cat:esoteric", "cat:symbolic",
     "cat:consciousness", "cat:structure", "cat:presence", "cat:action",
-    # Линзы
     "lens:neuro", "lens:cbt", "lens:jung", "lens:shaman",
     "lens:tarot", "lens:yoga", "lens:hindu", "lens:field",
     "lens:witness", "lens:stalker", "lens:architect",
     "lens:action", "lens:relational", "lens:parts",
     "lens:temporal", "lens:conflict", "lens:social_field",
-    # 🔥 Меню
     "start_analysis", "main_menu",
     "menu:meditations", "menu:channel",
-    "med:free_intro", "med:journey_guardian",
+    "med:journey_guardian",
 }
 
 users = {}
@@ -318,15 +303,39 @@ def answer_callback(callback_id: str) -> None:
     safe_telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
 
 def send_meditation(chat_id: int, meditation_id: str):
+    """Отправка аудио — пробуем sendAudio, если нет — sendDocument"""
     m = MEDITATIONS.get(meditation_id)
     if not m:
+        log(f"Медитация {meditation_id} не найдена")
         return
-    safe_telegram_api("sendAudio", {
+    
+    file_id = m.get("file_id", "")
+    if not file_id or file_id == "PASTE_FILE_ID":
+        log(f"File ID для {meditation_id} не указан")
+        return
+    
+    # Пробуем sendAudio
+    result = safe_telegram_api("sendAudio", {
         "chat_id": chat_id,
-        "audio": m["file_id"],
+        "audio": file_id,
         "caption": f"{m['title']}\n\n{m['description']}",
         "parse_mode": "HTML"
     })
+    
+    # Если не получилось — пробуем sendDocument
+    if not result or not result.get("ok"):
+        log(f"sendAudio не сработал: {result}, пробую sendDocument")
+        result = safe_telegram_api("sendDocument", {
+            "chat_id": chat_id,
+            "document": file_id,
+            "caption": f"{m['title']}\n\n{m['description']}",
+            "parse_mode": "HTML"
+        })
+    
+    if result and result.get("ok"):
+        log(f"Медитация {meditation_id} отправлена")
+    else:
+        log(f"Ошибка отправки медитации: {result}")
 
 # ================= MEDITATIONS LOGIC =================
 def has_access(user: dict, meditation_id: str) -> bool:
@@ -535,23 +544,13 @@ def build_meditations_keyboard():
     return {"inline_keyboard": rows}
 
 def build_channel_keyboard():
+    """Только кнопки — без дублирования текста"""
     return {"inline_keyboard": [
         [{"text": "📺 YouTube", "url": YOUTUBE_URL}],
         [{"text": "💬 Telegram канал", "url": TELEGRAM_CHANNEL_URL}],
         [{"text": "📷 Instagram", "url": INSTAGRAM_URL}],
         [{"text": "⬅ Назад", "callback_data": "main_menu"}],
     ]}
-
-CHANNEL_TEXT = (
-    "🌿 Роман Атма — пространство звука и осознания:\n\n"
-    f"📺 YouTube: {YOUTUBE_URL}\n"
-    f"💬 Telegram: {TELEGRAM_CHANNEL_URL}\n"
-    f"📷 Instagram: {INSTAGRAM_URL}\n\n"
-    "📅 Ближайшие события:\n"
-    "— Шаманское путешествие с бубном\n"
-    "— Концерт горлового пения\n"
-    "— Эфир с разбором опыта\n"
-)
 
 def build_start_keyboard():
     return {"inline_keyboard": [
@@ -657,7 +656,11 @@ def reset_user(uid):
 def handle_start(user: dict, uid: int) -> dict:
     reset_user(uid)
     return {
-        "text": "🌿 Я — проводник осознания.\n\nОпиши, что ты пережил — я помогу понять это через науку и смысл.",
+        "text": (
+            "🌿 Добро пожаловать.\n\n"
+            "Я — проводник осознания. Помогаю разобрать опыт через тело, мозг и смысл.\n\n"
+            "Выбери, с чего хочешь начать:"
+        ),
         "keyboard": build_main_menu()
     }
 
@@ -715,7 +718,10 @@ def handle_end(uid: int, user: dict) -> dict:
     ic = len(user.get("identity_story", []))
     dc = user.get("deep_count", 0)
     reset_user(uid)
-    return {"text": f"🌿 Цикл завершён.\n\nТы углублялся {dc} раз(а). За всё время — {ic} переживаний.\n\nМожешь начать с нового опыта.", "keyboard": build_main_menu()}
+    return {
+        "text": f"🌿 Цикл завершён.\n\nТы углублялся {dc} раз(а). За всё время — {ic} переживаний.",
+        "keyboard": build_main_menu()
+    }
 
 # ================= ROUTING =================
 def route_message(user: dict, text: str) -> str:
@@ -734,7 +740,7 @@ def route_callback(data: str) -> str | None:
 def execute_message(uid: int, action: str, text: str) -> dict | None:
     user = get_user(uid)
     if action == "start": return handle_start(user, uid)
-    if action == "reset_state": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт."}
+    if action == "reset_state": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт.", "keyboard": build_main_menu()}
     if action == "reject_short": return handle_reject_short()
     if action == "unified": return handle_unified(uid, text)
     if action == "user_answer": return handle_user_answer(uid, text)
@@ -743,7 +749,6 @@ def execute_message(uid: int, action: str, text: str) -> dict | None:
 def execute_callback(uid: int, action: str) -> dict | None:
     user = get_user(uid)
 
-    # 🔥 Главное меню
     if action == "main_menu": return {"text": "Выбери раздел:", "keyboard": build_main_menu()}
     if action == "start_analysis":
         if user.get("last_experience"):
@@ -751,26 +756,22 @@ def execute_callback(uid: int, action: str) -> dict | None:
             return {"text": f"Продолжим анализ твоего опыта.\n\n{question}", "keyboard": build_entry_keyboard()}
         return {"text": "Опиши свой опыт — и я помогу тебе его понять.", "keyboard": build_main_menu()}
 
-    # 🔥 Меню медитаций
     if action == "menu:meditations": return {"text": "🎧 Выбери практику:", "keyboard": build_meditations_keyboard()}
+    if action == "menu:channel":
+        return {"text": "🌿 Мои каналы и пространство:", "keyboard": build_channel_keyboard()}
 
-    # 🔥 Меню канала
-    if action == "menu:channel": return {"text": CHANNEL_TEXT, "keyboard": build_channel_keyboard()}
-
-    # 🔥 Выбор медитации
     if action.startswith("med:"):
         med_id = action.split(":", 1)[1]
         m = MEDITATIONS.get(med_id)
         if not m: return {"text": "Медитация не найдена."}
         if has_access(user, med_id):
             send_meditation(uid, med_id)
-            return {"text": f"🎧 «{m['title']}» отправлена.\n\n{m['description']}\n\nПриятной практики!", "keyboard": build_main_menu()}
+            return {"text": f"🎧 «{m['title']}» отправлена.\n\nПриятной практики!", "keyboard": build_main_menu()}
         return {"text": f"{m['title']}\n\n{m['description']}\n\n💰 Стоимость: {m['price']} ₽\n\nДля получения доступа нажми оплатить:", "keyboard": {"inline_keyboard": [
             [{"text": "💳 Оплатить", "url": PAYMENT_LINK}],
             [{"text": "⬅ Назад", "callback_data": "menu:meditations"}]
         ]}}
 
-    # 🔥 Авто-режим
     if action == "mode:auto":
         if not user.get("last_experience"): return {"text": "Сначала опиши опыт."}
         _, lens_key = auto_select_lens(user["last_experience"])
@@ -780,7 +781,6 @@ def execute_callback(uid: int, action: str) -> dict | None:
         schedule_save()
         return {"text": f"Авто-выбор: «{name}».\n\n{ensure_complete_sentence(result)}", "keyboard": build_continue_keyboard()}
 
-    # 🔥 Категории
     if action == "mode:categories": return {"text": "Выбери направление:", "keyboard": build_categories_keyboard()}
 
     if action.startswith("cat:"):
@@ -788,7 +788,6 @@ def execute_callback(uid: int, action: str) -> dict | None:
         update_user(uid, lambda u: u.__setitem__("selected_category", category_id))
         return {"text": f"Категория: {LENS_CATEGORIES.get(category_id, category_id)}\nВыбери линзу:", "keyboard": build_lenses_keyboard(category_id)}
 
-    # Базовые
     if action == "reset": reset_user(uid); schedule_save(); return {"text": "🔄 Пространство очищено. Опиши новый опыт.", "keyboard": build_main_menu()}
     if action == "self_inquiry:deep": return handle_deep(uid, user)
     if action == "self_inquiry:pni": return handle_pni(user, uid)
@@ -830,7 +829,7 @@ def process_callback(chat_id: int, data: str) -> None:
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/15.0"
+    server_version = "ShamanBot/15.1"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -839,7 +838,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "15.0", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "15.1", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -887,7 +886,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v15.0 FULL on {HOST}:{PORT}")
+    log(f"ShamanBot v15.1 FIX on {HOST}:{PORT}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:
