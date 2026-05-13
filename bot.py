@@ -187,16 +187,27 @@ llm_client = httpx.Client(
 )
 
 def safe_telegram_api(method: str, payload: dict) -> dict | None:
+    """Отправка запроса в Telegram API. Поддерживает файлы через _files."""
     if not BOT_TOKEN:
         return None
     try:
-        r = telegram_client.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-            json=payload, timeout=30
-        )
+        files = payload.pop("_files", None)
+        if files:
+            r = telegram_client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                data=payload,
+                files=files,
+                timeout=60
+            )
+        else:
+            r = telegram_client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                json=payload,
+                timeout=30
+            )
         if r.status_code == 200:
             return r.json()
-        log(f"Ошибка Telegram API: {r.status_code}")
+        log(f"Ошибка Telegram API: {r.status_code} {r.text[:200]}")
     except Exception as e:
         log(f"Исключение Telegram API: {type(e).__name__}")
     return None
@@ -303,39 +314,59 @@ def answer_callback(callback_id: str) -> None:
     safe_telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
 
 def send_meditation(chat_id: int, meditation_id: str):
-    """Отправка аудио — пробуем sendAudio, если нет — sendDocument"""
+    """Отправка медитации: sendAudio → sendDocument → скачать и отправить"""
     m = MEDITATIONS.get(meditation_id)
     if not m:
         log(f"Медитация {meditation_id} не найдена")
         return
     
     file_id = m.get("file_id", "")
-    if not file_id or file_id == "PASTE_FILE_ID":
+    if not file_id:
         log(f"File ID для {meditation_id} не указан")
         return
     
-    # Пробуем sendAudio
+    caption = f"{m['title']}\n\n{m['description']}"
+    
+    # Способ 1: sendAudio
     result = safe_telegram_api("sendAudio", {
         "chat_id": chat_id,
         "audio": file_id,
-        "caption": f"{m['title']}\n\n{m['description']}",
-        "parse_mode": "HTML"
+        "caption": caption
     })
-    
-    # Если не получилось — пробуем sendDocument
-    if not result or not result.get("ok"):
-        log(f"sendAudio не сработал: {result}, пробую sendDocument")
-        result = safe_telegram_api("sendDocument", {
-            "chat_id": chat_id,
-            "document": file_id,
-            "caption": f"{m['title']}\n\n{m['description']}",
-            "parse_mode": "HTML"
-        })
-    
     if result and result.get("ok"):
-        log(f"Медитация {meditation_id} отправлена")
-    else:
-        log(f"Ошибка отправки медитации: {result}")
+        log(f"Медитация {meditation_id} отправлена через sendAudio")
+        return
+    
+    # Способ 2: sendDocument
+    log(f"sendAudio не сработал, пробую sendDocument")
+    result = safe_telegram_api("sendDocument", {
+        "chat_id": chat_id,
+        "document": file_id,
+        "caption": caption
+    })
+    if result and result.get("ok"):
+        log(f"Медитация {meditation_id} отправлена через sendDocument")
+        return
+    
+    # Способ 3: Скачать файл и отправить заново
+    log(f"Скачиваю файл {file_id}...")
+    file_info = safe_telegram_api("getFile", {"file_id": file_id})
+    if file_info and file_info.get("ok"):
+        file_path = file_info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        
+        r = httpx.get(file_url, timeout=120)
+        if r.status_code == 200:
+            result = safe_telegram_api("sendDocument", {
+                "chat_id": chat_id,
+                "caption": caption,
+                "_files": {"document": ("meditation.mp3", r.content, "audio/mpeg")}
+            })
+            if result and result.get("ok"):
+                log(f"Медитация {meditation_id} отправлена через скачивание")
+                return
+    
+    log(f"Все способы отправки не сработали для {meditation_id}")
 
 # ================= MEDITATIONS LOGIC =================
 def has_access(user: dict, meditation_id: str) -> bool:
@@ -544,7 +575,6 @@ def build_meditations_keyboard():
     return {"inline_keyboard": rows}
 
 def build_channel_keyboard():
-    """Только кнопки — без дублирования текста"""
     return {"inline_keyboard": [
         [{"text": "📺 YouTube", "url": YOUTUBE_URL}],
         [{"text": "💬 Telegram канал", "url": TELEGRAM_CHANNEL_URL}],
@@ -767,7 +797,7 @@ def execute_callback(uid: int, action: str) -> dict | None:
         if has_access(user, med_id):
             send_meditation(uid, med_id)
             return {"text": f"🎧 «{m['title']}» отправлена.\n\nПриятной практики!", "keyboard": build_main_menu()}
-        return {"text": f"{m['title']}\n\n{m['description']}\n\n💰 Стоимость: {m['price']} ₽\n\nДля получения доступа нажми оплатить:", "keyboard": {"inline_keyboard": [
+        return {"text": f"{m['title']}\n\n{m['description']}\n\n💰 Стоимость: {m['price']} ₽", "keyboard": {"inline_keyboard": [
             [{"text": "💳 Оплатить", "url": PAYMENT_LINK}],
             [{"text": "⬅ Назад", "callback_data": "menu:meditations"}]
         ]}}
@@ -829,7 +859,7 @@ def process_callback(chat_id: int, data: str) -> None:
 
 # ================= WEBHOOK =================
 class WebhookHandler(BaseHTTPRequestHandler):
-    server_version = "ShamanBot/15.1"
+    server_version = "ShamanBot/15.2"
     def _send_json(self, code, payload):
         d = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -838,7 +868,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
     def do_GET(self):
-        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "15.1", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
+        self._send_json(200, {"ok": True, "service": "shaman-bot", "version": "15.2", "users": len(users)}) if self.path in ("/", "/health") else self._send_json(404, {"error": "Not found"})
     def do_POST(self):
         if self.path != "/webhook": return self._send_json(404, {"error": "Not found"})
         if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
@@ -886,7 +916,7 @@ def main():
     load_users()
     if not BOT_TOKEN: log("WARNING: BOT_TOKEN empty")
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
-    log(f"ShamanBot v15.1 FIX on {HOST}:{PORT}")
+    log(f"ShamanBot v15.2 FILE-FIX on {HOST}:{PORT}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:
